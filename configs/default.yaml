@@ -1,0 +1,118 @@
+{
+  "models": {
+    "paddle": {
+      "kind": "chat",
+      "base_url": "http://127.0.0.1:8100/v1",
+      "model": "paddleocr-vl",
+      "revision": "PaddlePaddle/PaddleOCR-VL",
+      "family": "ernie",
+      "concurrency": 8,
+      "tasks": {
+        "text": {"prompt": "OCR:", "format": "text", "max_tokens": 2048},
+        "table": {"prompt": "Table Recognition:", "format": "otsl", "max_tokens": 8192}
+      },
+      "launch": {
+        "argv": ["vllm", "serve", "PaddlePaddle/PaddleOCR-VL", "--served-model-name", "paddleocr-vl", "--host", "127.0.0.1", "--port", "8100", "--trust-remote-code", "--no-enable-prefix-caching", "--mm-processor-cache-gb", "0"]
+      }
+    },
+    "oxr": {
+      "kind": "chat",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "model": "oxr",
+      "revision": "OXR-1.0",
+      "family": "oxr",
+      "concurrency": 8,
+      "tasks": {
+        "text": {"prompt": "Recognize the content of the image.", "format": "text", "max_tokens": 2048},
+        "table": {"prompt": "Recognize the table of the image into html format.", "format": "html", "max_tokens": 8192}
+      },
+      "launch": {
+        "cwd": "${OXR_REPO}",
+        "env": {"MODEL_PATH": "${OXR_WEIGHTS}"},
+        "argv": ["bash", "services/oxr/start_vllm.sh", "--host", "127.0.0.1", "--port", "8080", "--gpu-memory-utilization", "0.70", "--max-num-seqs", "16"]
+      }
+    },
+    "ovis": {
+      "kind": "chat",
+      "base_url": "http://127.0.0.1:8102/v1",
+      "model": "ovis-ocr3",
+      "revision": "ATH-MaaS/OvisOCR3",
+      "family": "qwen3.5",
+      "concurrency": 4,
+      "request": {"chat_template_kwargs": {"enable_thinking": false}},
+      "tasks": {
+        "text": {"prompt": "Transcribe all visible text in the image in reading order. Output only the plain text.", "format": "text", "max_tokens": 2048},
+        "table": {"prompt": "Transcribe the table in the image. Return only one HTML table with every visible cell, preserving rowspans, colspans and cell text.", "format": "html", "max_tokens": 8192}
+      },
+      "launch": {
+        "argv": ["vllm", "serve", "ATH-MaaS/OvisOCR3", "--served-model-name", "ovis-ocr3", "--host", "127.0.0.1", "--port", "8102", "--max-model-len", "24576", "--limit-mm-per-prompt", "{\"image\":1}"]
+      }
+    },
+    "jev": {
+      "kind": "jev",
+      "base_url": "http://127.0.0.1:18500",
+      "model": "minicpm-ocr-jev",
+      "revision": "openbmb/MiniCPM-OCR-Jev",
+      "family": "qwen3.5",
+      "concurrency": 4,
+      "launch": {
+        "argv": ["vllm", "serve", "${JEV_WEIGHTS}", "--served-model-name", "minicpm-ocr-jev", "--runner", "pooling", "--convert", "classify", "--hf-overrides", "{\"num_labels\":2}", "--limit-mm-per-prompt", "{\"image\":2}", "--chat-template-content-format", "openai", "--host", "127.0.0.1", "--port", "18499"]
+      },
+      "sidecars": {
+        "render": {
+          "cwd": "${MINICPM_OCR_REPO}/scripts/minicpm-ocr-jev",
+          "argv": ["bash", "sdk/start_render_score.sh", "18500", "http://127.0.0.1:18499"]
+        }
+      }
+    },
+    "internal_vlm": {
+      "kind": "chat",
+      "base_url": "${RSI_INTERNAL_VLM_URL}",
+      "model": "internal-vlm",
+      "revision": "set-to-your-internal-release",
+      "family": "qwen3.5",
+      "api_key_env": "RSI_INTERNAL_VLM_KEY",
+      "concurrency": 2,
+      "tasks": {
+        "text": {"prompt": "Transcribe every visible character in reading order. Preserve original digits, punctuation and units. Output only the transcription.", "format": "text", "max_tokens": 4096},
+        "table": {"prompt": "Transcribe only the visible table into one HTML table. Retain the original cell contents and order, empty cells and merged cells. Return only the table.", "format": "html", "max_tokens": 12288}
+      }
+    }
+  },
+  "capture": {"pipeline": {"pipeline_version": "v1"}, "predict": {"use_layout_detection": true, "use_queues": false}},
+  "mining": {
+    "target": "paddle",
+    "teachers": ["oxr", "ovis"],
+    "judge": "jev",
+    "strong_teacher": "internal_vlm",
+    "strong_budget": 0,
+    "splits": ["mine", "train"],
+    "workers": 12,
+    "weights": {"target_risk": 0.35, "disagreement": 0.25, "judge_gain": 0.20, "numeric_conflict": 0.20},
+    "low_judge": 0.45,
+    "disagreement": 0.12,
+    "judge_gain": 0.35,
+    "proposal_judge": 0.9,
+    "proposal_families": 2,
+    "review_per_task": {"text": 300, "table": 300},
+    "review_per_document": 30,
+    "audit_rate": 0.1,
+    "audit_seed": 20261119
+  },
+  "reward": {
+    "table_format": "otsl",
+    "text": {"character": 0.85, "numeric": 0.15},
+    "table": {"structure": 0.45, "content": 0.45, "numeric": 0.10}
+  },
+  "training": {
+    "sft": {
+      "cwd": "${ERNIEKIT_REPO}",
+      "model": "PaddlePaddle/PaddleOCR-VL",
+      "argv": ["erniekit", "train", "examples/configs/PaddleOCR-VL/sft/run_ocr_vl_sft_16k.yaml", "learning_rate=5e-6", "max_steps=100", "warmup_steps=2", "packing_size=1", "gradient_accumulation_steps=4", "save_to_hf=true"]
+    },
+    "grpo": {
+      "model": "PaddlePaddle/PaddleOCR-VL",
+      "argv": ["swift", "rlhf", "--rlhf_type", "grpo", "--model_type", "paddle_ocr", "--template", "paddle_ocr", "--tuner_type", "lora", "--use_vllm", "false", "--split_dataset_ratio", "0", "--remove_unused_columns", "false", "--num_generations", "4", "--per_device_train_batch_size", "4", "--gradient_accumulation_steps", "1", "--max_steps", "100", "--max_length", "16384", "--max_completion_length", "4096", "--learning_rate", "1e-6", "--beta", "0.04"]
+    }
+  }
+}
