@@ -55,11 +55,22 @@ def evidence(case, inputs, target_alias, policy):
         family_scores.append(mean)
     disagreement = sum(family_scores) / len(family_scores) if family_scores else None
     gain = max(0, max(scores) - target_score) if scores and target_score is not None else None
-    malformed = target["status"] in {"empty", "format_invalid"}
     signals = {
         "target_risk": 1 - target_score if target_score is not None else None,
         "disagreement": disagreement, "judge_gain": gain, "numeric_conflict": float(numbers_conflict) if family_scores else None,
     }
+    return classify(target, signals, policy)
+
+
+FIXED_RULES = ("numeric_conflict", "empty", "format_invalid", "judge_precheck_reject")
+
+
+def classify(target, signals, policy):
+    """Apply the mining policy to measured OCR evidence, including historical runs."""
+    malformed = target["status"] in {"empty", "format_invalid"}
+    target_score = target.get("judge", {}).get("prob_yes")
+    disagreement = signals["disagreement"]
+    gain = signals["judge_gain"]
     weights = policy["weights"]
     known = [key for key, value in signals.items() if value is not None and weights[key] > 0]
     risk = sum(weights[key] * signals[key] for key in known) / sum(weights[key] for key in known) if known else None
@@ -72,10 +83,12 @@ def evidence(case, inputs, target_alias, policy):
         reasons.append("teacher_disagreement")
     if gain is not None and gain >= policy["judge_gain"]:
         reasons.append("better_judged_candidate")
-    if numbers_conflict:
+    if signals["numeric_conflict"]:
         reasons.append("numeric_conflict")
     if target.get("judge", {}).get("status") == "precheck_reject":
         reasons.append("judge_precheck_reject")
+    switches = policy.get("fixed_rules", {})
+    reasons = [reason for reason in reasons if reason not in FIXED_RULES or switches.get(reason, True)]
     operational = target["status"] in {"service_error", "incomplete"}
     return {"signals": signals, "hard_case": bool(reasons) and not operational,
             "priority": 1.0 if malformed else risk, "reasons": reasons,
@@ -162,31 +175,58 @@ def select(rows, policy):
     return chosen
 
 
-def mine(config, manifest, output):
-    output.mkdir(parents=True, exist_ok=True)
+def eligible_regions(config, manifest):
     policy = config["mining"]
     target = config["models"][policy["target"]]
-    miner = Miner(config, Cache(output / "cache.sqlite"), manifest.parent)
     doc_splits = {}
     region_ids = set()
+    for row in read_rows(manifest):
+        split = row.setdefault("split", "mine")
+        doc_id = row["doc_id"]
+        if doc_splits.setdefault(doc_id, split) != split:
+            raise ValueError(f"document appears in multiple splits: {doc_id}")
+        if split in policy["splits"] and row["task"] in target["tasks"]:
+            key = doc_id, row["page_id"], row["region_id"], row["task"]
+            if key in region_ids:
+                raise ValueError(f"duplicate region: {key}")
+            region_ids.add(key)
+            yield row
 
-    def eligible():
-        for row in read_rows(manifest):
-            split = row.setdefault("split", "mine")
-            doc_id = row["doc_id"]
-            if doc_splits.setdefault(doc_id, split) != split:
-                raise ValueError(f"document appears in multiple splits: {doc_id}")
-            if split in policy["splits"] and row["task"] in target["tasks"]:
-                key = doc_id, row["page_id"], row["region_id"], row["task"]
-                if key in region_ids:
-                    raise ValueError(f"duplicate region: {key}")
-                region_ids.add(key)
-                yield row
+
+def warm(config, manifest, output, alias):
+    policy = config["mining"]
+    if alias not in [policy["target"], *policy["teachers"]]:
+        raise ValueError(f"{alias} is not a configured OCR reader")
+    output.mkdir(parents=True, exist_ok=True)
+    service = Service(config["models"][alias], Cache(output / "cache.sqlite"))
+
+    def read(row):
+        image = (manifest.parent / row["image"]).read_bytes()
+        if row.get("image_sha256") not in (None, digest(image)):
+            raise ValueError(f"image changed after capture: {row['image']}")
+        return service.read(row["task"], image)["status"]
+
+    rows = (row for row in eligible_regions(config, manifest) if row["task"] in service.config["tasks"]
+            and not (alias == policy["target"] and "target" in row))
+    with ThreadPoolExecutor(max_workers=policy["workers"]) as pool:
+        counts = Counter()
+        while batch := list(islice(rows, policy["workers"] * 4)):
+            counts.update(pool.map(read, batch))
+    return dict(counts)
+
+
+def mine(config, manifest, output, cached_readers=False):
+    output.mkdir(parents=True, exist_ok=True)
+    policy = config["mining"]
+    miner = Miner(config, Cache(output / "cache.sqlite"), manifest.parent)
+    if cached_readers:
+        for alias in [policy["target"], *policy["teachers"]]:
+            miner.services[alias].cache_only = True
 
     rows = []
     workers = policy["workers"]
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = eligible()
+        jobs = eligible_regions(config, manifest)
         while batch := list(islice(jobs, workers * 4)):
             rows.extend(pool.map(miner.run, batch))
         for row in rows:

@@ -8,6 +8,19 @@ from .reward import validate_weights
 from .store import digest, json_text, read_rows, write_rows
 
 
+def sft_record(image, prompt, answer):
+    return {"image_info": [{"matched_text_index": 0, "image_url": str(image)}],
+            "text_info": [{"text": prompt, "tag": "mask"}, {"text": answer, "tag": "no_mask"}]}
+
+
+def paddle_sft_record(image, task, label):
+    if task == "table":
+        return sft_record(image, "Table Recognition:", table_otsl(table_cells(label)))
+    if task == "text":
+        return sft_record(image, "OCR:", label)
+    raise ValueError(f"unsupported PaddleOCR-VL task: {task}")
+
+
 def export_training(config, evidence_path, review_path, output):
     evidence = {row["case_id"]: row for row in read_rows(evidence_path)}
     target = config["models"][config["mining"]["target"]]
@@ -22,6 +35,8 @@ def export_training(config, evidence_path, review_path, output):
         if review["status"] != "approved":
             continue
         row = evidence[case_id]
+        if row.get("split") == "benchmark":
+            continue
         image = (evidence_path.parent / row["image"]).resolve()
         if review["image_sha256"] != row["image_sha256"] or digest(image.read_bytes()) != row["image_sha256"]:
             raise ValueError(f"review image differs from captured image: {case_id}")
@@ -42,8 +57,7 @@ def export_training(config, evidence_path, review_path, output):
         grouped[split].append((row, review, str(image), spec["prompt"], answer, solution))
     for split, rows in grouped.items():
         write_rows(output / f"sft_{split}.jsonl", (
-            {"image_info": [{"matched_text_index": 0, "image_url": image}],
-             "text_info": [{"text": prompt, "tag": "mask"}, {"text": answer, "tag": "no_mask"}]}
+            sft_record(image, prompt, answer)
             for _, _, image, prompt, answer, _ in rows
         ))
         write_rows(output / f"grpo_{split}.jsonl", (

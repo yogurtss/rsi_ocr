@@ -1,5 +1,6 @@
 import base64
 import json
+from collections import defaultdict
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -8,6 +9,31 @@ from threading import Lock, Thread
 from .config import expand
 from .service import Service, ServiceError, chat_result
 from .store import atomic_output, digest, json_text, read_rows, write_rows
+
+
+def locate_crops(image, boxes, root, rows):
+    """Keep only unique pixel matches to a rectangle on the original page."""
+    from PIL import Image
+
+    def pixels(rgb):
+        return rgb.size, digest(rgb.tobytes())
+
+    positions = defaultdict(set)
+    with Image.open(image) as source:
+        page = source.convert("RGB")
+    for item in boxes:
+        if "coordinate" not in item or len(item["coordinate"]) != 4:
+            continue
+        left, top, right, bottom = (int(value) for value in item["coordinate"])
+        box = max(0, left), max(0, top), min(page.width, right), min(page.height, bottom)
+        if box[0] < box[2] and box[1] < box[3]:
+            positions[pixels(page.crop(box))].add(box)
+    for row in rows:
+        with Image.open(root / row["image"]) as crop:
+            matches = positions.get(pixels(crop.convert("RGB")), ())
+        if len(matches) == 1:
+            row["bbox"], = matches
+            row["bbox_source"] = "exact_paddle_layout_crop"
 
 
 class Recorder:
@@ -105,7 +131,7 @@ def capture_pages(config, manifest, root):
     def capture_key(page, image):
         return digest(json_text([page, str(image), digest(image.read_bytes()), options,
                                  expand(target["base_url"]), target["model"], target["revision"],
-                                 target["tasks"]]).encode())
+                                 target["tasks"], "layout-bbox-v1"]).encode())
 
     def rows():
         with recorder.listen() as url:
@@ -125,9 +151,13 @@ def capture_pages(config, manifest, root):
                     "doc_id": page["doc_id"], "page_id": page["page_id"],
                     "split": page.get("split", "mine"), "page_image": str(image),
                 }
+                if "eval_partition" in page:
+                    recorder.page["eval_partition"] = page["eval_partition"]
                 recorder.rows = []
-                for _ in pipeline.predict_iter(str(image), **options.get("predict", {})):
-                    pass
+                for result in pipeline.predict_iter(str(image), **options.get("predict", {})):
+                    boxes = result.get("layout_det_res", {}).get("boxes", [])
+                    if boxes:
+                        locate_crops(image, boxes, root, recorder.rows)
                 if all(row["target"]["status"] != "service_error" for row in recorder.rows):
                     write_rows(shard, recorder.rows)
                 yield from recorder.rows

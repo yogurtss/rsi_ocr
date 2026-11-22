@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GlyphStack · 文档复核</title>
+  <link rel="stylesheet" href="/assets/workbench.css">
+  <script src="/assets/workbench.js" defer></script>
+  <script src="/assets/settings.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="identity"><span class="brand" aria-hidden="true">GS</span><h1>GlyphStack</h1></div>
+    <nav class="navigation" aria-label="工作台页面">
+      <button id="view-review" aria-pressed="true">难例复核</button>
+      <button id="view-settings" aria-pressed="false">流程与设置</button>
+      <button id="view-overview" aria-pressed="false">批次总览</button>
+    </nav>
+    <div class="top-controls">
+      <details id="runtime" class="export-menu" hidden><summary id="runtime-summary">模型后台</summary>
+        <div id="runtime-detail"></div></details>
+      <label class="visually-hidden" for="batch">运行批次</label>
+      <button id="import-open">导入结果</button><select id="batch"></select>
+      <details class="export-menu">
+        <summary>导出</summary>
+        <div><a id="review-download">带时间戳的复核记录</a>
+          <button type="button" id="training-download" data-export="train" hidden>SFT 训练集 JSONL</button>
+          <button type="button" id="validation-download" data-export="val" hidden>SFT 验证集 JSONL</button></div>
+      </details>
+    </div>
+  </header>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <div id="workspace" class="workspace">
+    <aside class="queue" aria-label="样本队列">
+      <div class="queue-controls">
+        <div class="queue-title"><h2>样本队列</h2><span id="queue-count"></span></div>
+        <label class="visually-hidden" for="search">搜索样本</label>
+        <input id="search" type="search" placeholder="搜索文档、区域或样本 ID">
+        <div id="difficulty" class="segments" aria-label="难度"></div>
+        <button id="bulk" hidden></button><button id="undo" hidden>撤销上次批量通过</button>
+        <div id="task-filters" class="segments" aria-label="任务">
+          <button data-task="all" aria-pressed="true">全部</button>
+          <button data-task="text" aria-pressed="false">文字</button>
+          <button data-task="table" aria-pressed="false">表格</button>
+        </div>
+        <div class="filter-row">
+          <label><span>样本范围</span><select id="scope">
+            <option value="queue">审核队列</option><option value="all">全部样本</option>
+            <option value="audit">随机抽审</option><option value="outside">未入队</option>
+          </select></label>
+          <label><span>复核状态</span><select id="status">
+            <option value="all">全部状态</option><option value="pending">未复核</option>
+            <option value="approved">Pass</option><option value="rejected">Not pass</option>
+            <option value="needs_check">待核查</option>
+          </select></label>
+        </div>
+        <details class="advanced"><summary>更多筛选</summary>
+          <label>入队原因<select id="reason"><option value="all">全部原因</option></select></label>
+          <label>Paddle 评分状态<select id="judge"><option value="all">全部评分状态</option></select></label>
+          <label id="reference-filter">参考标注<select id="gold">
+            <option value="all">全部样本</option><option value="error">Paddle 有误</option>
+            <option value="repairable">有正确替代</option>
+          </select></label>
+        </details>
+      </div>
+      <div id="queue-list" class="queue-list"></div>
+    </aside>
+    <main id="inspection" class="inspection" aria-label="样本详情"><p class="empty">正在读取批次…</p></main>
+  </div>
+  <main id="overview" class="overview" hidden></main>
+  <main id="settings" class="settings" hidden>
+    <header class="settings-heading"><div><h2>识别流程与阈值</h2><p>沿着同一块裁图，查看模型如何识别、评分和筛选难例。</p></div>
+      <span id="settings-batch"></span></header>
+    <section class="deployment-settings panel">
+      <div><h3>模型部署</h3><p>按需模式逐个加载并释放模型。CLI 常驻模式复用手动启动的服务，OXR 与 Ovis 并行转录。</p></div>
+      <div><label>运行方式 <select id="deployment-mode" disabled><option value="on_demand">按需加载</option><option value="managed">CLI 多模型常驻</option></select></label>
+      <button id="save-mode" disabled>保存部署模式</button></div><p id="mode-status" role="status"></p>
+    </section>
+    <section class="flow-sheet" aria-label="识别与难例筛选流程">
+      <div class="flow-unit"><h3>版面与裁图</h3><div class="flow-tile"><strong>PDF / 图片</strong><span>Paddle 版面检测</span><b>文字或表格裁图</b></div></div>
+      <span class="flow-arrow" aria-hidden="true">→</span>
+      <div class="flow-unit"><h3>同图独立识别</h3><div class="readers" id="flow-readers"></div></div>
+      <span class="flow-arrow" aria-hidden="true">→</span>
+      <div class="flow-unit"><h3>证据与阈值</h3><div class="flow-rules">
+        <button data-rule="low_judge"><strong>Jev · 基线质量分</strong><span>核对裁图与基线转录</span></button>
+        <button data-rule="judge_gain"><strong>Jev · 候选增益</strong><span>比较候选与基线的评分</span></button>
+        <button data-rule="disagreement"><strong>OCR · 模型分歧</strong><span>比较转录距离</span></button></div></div>
+      <span class="flow-arrow" aria-hidden="true">→</span>
+      <div class="flow-unit"><h3>筛选与复核</h3><div class="flow-tile"><strong>难例判定</strong><span>任一规则命中</span><b>配额排序 + 随机抽检</b><span>进入人工复核队列</span></div></div>
+    </section>
+    <div id="settings-empty" class="settings-empty">导入一个已完成的批次，即可用实际样本试调阈值。 <button id="settings-import">导入结果</button></div>
+    <div id="tuning" class="tuning" hidden>
+      <output class="mobile-preview" id="mobile-preview"></output>
+      <section class="tuning-panel"><h3>判定阈值</h3><p>点击流程节点可定位规则。拖动滑块或输入数值试算。一条样本可命中多条规则。</p>
+        <div id="threshold-controls"></div>
+        <h4 class="rules-heading">独立触发规则</h4><p>开启后，命中任一项即可判为难例。关闭后，样本仍按其余规则和分数判断。</p>
+        <div id="fixed-switches"></div>
+        <details class="fixed-rules"><summary>入队与排序</summary><p>数字冲突仍参与加权排序；空转录和无效格式的排序优先级为 1。运行异常单列。审核队列沿用本批次的抽检、配额与裁图去重。</p></details>
+      </section>
+      <section class="preview-panel"><h3>筛选预览</h3><div id="preview-counts" aria-live="polite"></div>
+        <p id="preview-status" role="status"></p>
+        <div class="settings-actions"><button id="apply-policy" class="primary" disabled>应用到本批次</button>
+        <button id="reset-policy">恢复运行时阈值</button></div>
+      </section>
+    </div>
+  </main>
+  <dialog id="import-dialog"><div class="dialog-bar"><strong>导入已完成的批次</strong><form method="dialog"><button>关闭</button></form></div>
+    <div class="import-body"><p id="import-root"></p><select id="import-list" aria-label="结果批次"></select>
+    <button id="import-submit" class="primary">导入并查看</button><p id="import-message" role="status"></p></div></dialog>
+  <dialog id="image-dialog">
+    <div class="dialog-bar"><strong id="dialog-title"></strong>
+      <div class="dialog-actions"><button type="button" id="img-minus" aria-label="缩小">−</button><button id="img-plus" aria-label="放大">＋</button><button id="img-fit">适宽</button><button id="img-native">原始像素</button><button id="img-full">全屏</button><button id="draw-location" hidden>手动画框</button>
+        <form method="dialog"><button>关闭</button></form></div></div>
+    <p id="location-hint" class="location-caption" role="status" hidden></p>
+    <div id="dialog-content"></div>
+  </dialog>
+  <dialog id="table-dialog">
+    <div class="dialog-bar">
+      <strong>表格大图对照</strong>
+      <div class="dialog-actions">
+        <label>基准<select id="table-base"></select></label><label>当前模型<select id="table-model"></select></label>
+        <label>视图<select id="table-layout"><option value="pair">并排对照</option><option value="single">只看当前结果</option></select></label>
+        <label>缩放<select id="table-zoom"><option value="0.8">80%</option><option value="1" selected>100%</option><option value="1.25">125%</option><option value="1.5">150%</option></select></label>
+        <label><input type="checkbox" id="table-sync" checked>联动滚动</label><button id="table-prev">上一处差异</button><button id="table-next">下一处差异</button><form method="dialog"><button>关闭</button></form>
+      </div>
+    </div>
+    <div class="sheet-tools"><span id="sheet-range"></span>
+      <div><button data-step="up">上一组行</button><button data-step="down">下一组行</button>
+      <button data-step="left">上一组列</button><button data-step="right">下一组列</button></div>
+      <form id="sheet-jump"><label>行 <input type="number" id="sheet-row" min="1" value="1" required></label>
+      <label>列 <input type="number" id="sheet-col" min="1" value="1" required></label><button>定位</button></form>
+    </div>
+    <div id="table-dialog-content"></div>
+    <div id="cell-detail" aria-live="polite"></div>
+    <div class="table-review-actions"><span id="table-feedback" role="status"></span>
+      <button type="button" id="table-reject">Not pass</button>
+      <button type="button" id="table-pass" class="primary">Pass</button>
+    </div>
+  </dialog>
+</body>
+</html>

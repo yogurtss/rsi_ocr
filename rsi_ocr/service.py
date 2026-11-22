@@ -26,6 +26,7 @@ class Service:
     def __init__(self, config, cache=None):
         self.config = config
         self.cache = cache
+        self.cache_only = False
         self.slots = BoundedSemaphore(config.get("concurrency", 4))
 
     def request(self, path, payload=None):
@@ -51,6 +52,8 @@ class Service:
         hit = self.cache.get(key) if self.cache else None
         if hit is not None:
             return hit
+        if self.cache_only:
+            raise ServiceError(f"missing cached response for {self.config['model']} at {path}; run warm first")
         start = time.perf_counter()
         try:
             result = convert(self.request(path, payload))

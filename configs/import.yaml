@@ -1,0 +1,46 @@
+# 从仓库根目录运行。相对路径从当前工作目录解析。
+model_root: /mnt/g/models       # Windows 的 G:\models；也可指向 runs/model-cache
+minicpm_repo: runs/MiniCPM-OCR  # Jev 官方渲染服务的源码目录
+output_root: runs/imports       # 默认在这里创建 UTC 时间戳批次
+extensions: [.pdf, .png, .jpg, .jpeg]  # 可按需缩减；忽略扩展名大小写
+recursive: true                 # 文件夹模式同时处理子目录
+dpi: 144                        # 每页渲染分辨率，增大可提高小字清晰度和内存用量
+port: 8517                      # 独立启动的质控台监听端口
+mining:
+  fixed_rules:                  # 是否将该信号作为独立难例原因
+    numeric_conflict: true      # 任一教师的数字与基线不同
+    empty: true                 # 基线返回空转录
+    format_invalid: true        # 基线表格无法按声明格式解析
+    judge_precheck_reject: true # Jev 在评分前拒绝基线转录
+  low_judge: 0.45               # Paddle 的 Jev 分数 ≤ 此值触发难例
+  disagreement: 0.12            # 跨模型家族平均分歧 ≥ 此值触发难例
+  judge_gain: 0.35              # 最优候选比 Paddle 高出此值或更多时触发
+  weights:                      # 难例排序权重；缺失信号从分母移除
+    target_risk: 0.35           # 1 − Paddle 的 Jev 分数
+    disagreement: 0.25          # 教师与 Paddle 的跨家族平均距离
+    judge_gain: 0.20            # 最佳候选相对 Paddle 的正向分差
+    numeric_conflict: 0.20      # 任一候选数字冲突也会独立触发难例
+  audit_rate: 0.10               # 全量样本随机抽检比例
+  review_per_document: 30       # 每文档、每任务的难例入队上限
+  review_per_task: {text: 300, table: 300}  # 本批每种任务的难例配额
+  proposal_judge: 0.90          # 推荐候选所需的最低 Jev 分
+  proposal_families: 2          # 推荐候选所需的一致模型家族数
+
+# GlyphStack 终端后台。run 只需后台端口；省略输入路径时处理此目录。
+manager_port: 8520
+input_path: data/inbox
+deployment:
+  mode: on_demand               # on_demand 按需轮换；managed 由 CLI 启停，多模型可同时常驻
+  gpu: "0"                     # CUDA 设备编号，单卡依次加载模型
+  gpu_memory: 0.65             # 每个 vLLM 服务的显存占用比例
+  max_sequences: 4             # 同时处理的最大序列数
+  layout_path: PP-DocLayoutV3  # 版面检测权重，相对于 model_root
+  models:
+    # display_name 可自定义 CLI 卡片标题。修改模型配置后按 T 重启该模型生效。
+    # 各模型可覆盖 gpu、gpu_memory、max_sequences 和 tensor_parallel。
+    # 双卡例：gpu: "2,3", tensor_parallel: 2, gpu_memory: 0.80。
+    # path 相对于 model_root，也可填写绝对路径。context 为最大上下文 token 数。
+    paddle: {path: paddleocr-vl-16, port: 8100, context: 12288}
+    oxr:    {path: OXR-1.0, port: 8080, context: 16384}
+    ovis:   {path: OvisOCR3, port: 8102, context: 16384}
+    jev:    {path: MiniCPM-OCR-Jev, port: 18499, render_port: 18500, context: 16384}
