@@ -31,7 +31,7 @@
   </header>
   <div id="notice" class="notice" role="status" hidden></div>
   <div id="workspace" class="workspace">
-    <aside class="queue" aria-label="样本队列">
+    <aside id="sample-queue" class="queue" aria-label="样本队列">
       <div class="queue-controls">
         <div class="queue-title"><h2>样本队列</h2><span id="queue-count"></span></div>
         <label class="visually-hidden" for="search">搜索样本</label>
@@ -65,6 +65,10 @@
       </div>
       <div id="queue-list" class="queue-list"></div>
     </aside>
+    <div class="queue-rail">
+      <button id="queue-toggle" type="button" aria-controls="sample-queue" aria-expanded="true" aria-label="收起队列" title="收起队列">‹</button>
+      <div id="queue-divider" role="separator" tabindex="0" aria-label="样本队列宽度" aria-orientation="vertical" aria-controls="sample-queue" aria-valuemin="0" aria-valuemax="460" title="拖动调整宽度，也可使用左右方向键"></div>
+    </div>
     <main id="inspection" class="inspection" aria-label="样本详情"><p class="empty">正在读取批次…</p></main>
   </div>
   <main id="overview" class="overview" hidden></main>

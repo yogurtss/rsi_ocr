@@ -422,3 +422,33 @@ dialog::backdrop { background: #101b34bb; }
 @media (max-width: 700px) {
   #model-pair.table-preview { grid-template-columns: minmax(0, 1fr); }
 }
+
+.inspection > .preview-tools { background: white; border: 1px solid var(--line); border-radius: 9px; margin-bottom: 12px; }
+.source-fold > summary { cursor: pointer; padding: 8px 12px; color: #205b54; font-size: .9rem; }
+#preview-range[hidden] { display: none; }
+#model-pair { grid-template-columns: repeat(var(--models, 1), minmax(0, 1fr)); }
+#model-pair h4 small { margin-left: .6em; font-weight: normal; }
+.table-preview .output-scroll { max-height: 66dvh; scrollbar-gutter: stable; }
+.table-preview .sheet td { min-width: 5ch; }
+@media (max-width: 700px) {
+  #model-pair { grid-template-columns: minmax(0, 1fr); }
+}
+
+.queue-rail { display: none; }
+@media (min-width: 821px) {
+  .workspace { grid-template-columns: var(--queue-width, 290px) 18px minmax(0,1fr); }
+  .queue-closed .queue { visibility: hidden; overflow: hidden; }
+  .queue-rail { position: sticky; top: 66px; height: calc(100dvh - 66px); display: flex; flex-direction: column; align-items: stretch; }
+  #queue-toggle { padding: 0; margin-top: 14px; min-height: 32px; font-size: 1.1rem; }
+  #queue-divider { flex: 1; cursor: col-resize; touch-action: none; background: linear-gradient(to right, transparent 45%, #b6cbc5 45% 55%, transparent 55%); }
+  #queue-divider:hover, #queue-divider:focus-visible { background-color: #dcece7; }
+}
+.diff-list { grid-column: 1/-1; min-width: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.diff-list header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; }
+.diff-list header strong { margin-right: auto; }
+.diff-list table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.diff-list td, .diff-list th { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--line); }
+.diff-list td { min-width: 10ch; max-width: 35em; overflow-wrap: anywhere; white-space: pre-wrap; }
+.diff-list th { white-space: nowrap; }
+.diff-list small { color: var(--muted); }
+.diff-list td.changed { background: #fff0d4; color: #763a0d; }

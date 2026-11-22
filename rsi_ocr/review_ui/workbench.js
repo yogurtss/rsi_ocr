@@ -22,6 +22,51 @@ const nameOf = (alias) => names[alias] || alias;
 const state = {batch: "", data: null, task: "all", rows: [], current: null, case: null,
   compare: null, difference: true, request: 0, loading: false, saving: false};
 
+function setupQueueWidth() {
+  const workspace = q("#workspace"), divider = q("#queue-divider"), toggle = q("#queue-toggle");
+  let width = 290, expanded = 290;
+  try {
+    const saved = JSON.parse(localStorage.getItem("glyphstack.queueWidth"));
+    if (Number.isFinite(saved?.width) && Number.isFinite(saved.expanded)) {
+      width = saved.width;
+      expanded = saved.expanded;
+    }
+  } catch {}
+  function apply(value, save = false) {
+    width = value < 110 ? 0 : Math.max(180, Math.min(460, value));
+    if (width) expanded = width;
+    workspace.style.setProperty("--queue-width", width + "px");
+    workspace.classList.toggle("queue-closed", !width);
+    toggle.textContent = width ? "‹" : "›";
+    toggle.title = width ? "收起队列" : "展开队列";
+    toggle.setAttribute("aria-label", toggle.title);
+    toggle.setAttribute("aria-expanded", String(!!width));
+    divider.setAttribute("aria-valuenow", String(width));
+    if (save) {
+      try { localStorage.setItem("glyphstack.queueWidth", JSON.stringify({width, expanded})); } catch {}
+    }
+  }
+  apply(width);
+  toggle.onclick = () => apply(width ? 0 : expanded, true);
+  divider.onpointerdown = event => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    divider.setPointerCapture(event.pointerId);
+  };
+  divider.onpointermove = event => {
+    if (divider.hasPointerCapture(event.pointerId)) apply(event.clientX - workspace.getBoundingClientRect().left);
+  };
+  divider.onlostpointercapture = () => apply(width, true);
+  divider.onkeydown = event => {
+    const values = {ArrowLeft:width <= 180 ? 0 : width-24, ArrowRight:width ? width+24 : 180, Home:0, End:460};
+    if (event.key in values) {
+      event.preventDefault();
+      apply(values[event.key], true);
+    }
+  };
+}
+setupQueueWidth();
+
 function notice(message, error = false) {
   const element = q("#notice");
   element.textContent = message;
@@ -208,15 +253,6 @@ function modelVerdict(alias, row) {
       ${recommended ? '<small class="model-recommendation">系统推荐</small>' : ""}</span>`;
 }
 
-function modelTile(alias, row) {
-  const score = row.models[alias].judge?.prob_yes;
-  return `<button class="model-tile" type="button" aria-pressed="${state.compare === alias}" data-model="${esc(alias)}">
-    <span class="model-name">${esc(nameOf(alias))}${alias === row.target_alias ? '<small>基线</small>' : ""}</span>
-    <span class="model-score">${number(score)}</span>
-    ${modelVerdict(alias, row)}
-    </button>`;
-}
-
 function sheetWidth(view) {
   return (view?.rows || []).reduce((n,row)=>row.reduce((m,c)=>Math.max(m,c.col+c.width),n),0);
 }
@@ -286,9 +322,9 @@ function resultCard(row, alias, view, highlight, onlyChanges = false, page = nul
     if (c.changed) n.changed++;
     return n;
   },{merged:0,changed:0}) : null;
-  return `<section class="output-card"><h4>${esc(alias === "reference" ? "参考标注" : nameOf(alias))}${dimensions}${page ? `<small>Jev ${number(row.models[alias].judge?.prob_yes)}</small>` : ""}</h4>
+  return `<section class="output-card"><h4>${esc(alias === "reference" ? "参考标注" : nameOf(alias))}${dimensions}<small>Jev ${number(row.models[alias].judge?.prob_yes)}</small></h4>
     <div class="output-scroll" tabindex="0">${body}</div>
-    ${page ? `<div class="output-metrics">${modelVerdict(alias,row)}</div>` : ""}
+    <div class="output-metrics">${modelVerdict(alias,row)}</div>
     ${counts ? `<div class="output-metrics">合并格 ${counts.merged} · 当前结果差异格 ${counts.changed}</div>` : ""}
     ${metricLine(row.metrics[alias], view)}</section>`;
 }
@@ -316,32 +352,75 @@ try {
   if (Array.isArray(stored)) preferredModels = stored;
 } catch {}
 let previewRow, previewTop = 0, previewLeft = 0;
-const previewSize = {height: 8, width: 1};
+const previewSize = {height: 96, width: 64};
 
 function visibleModels(row, keys) {
   const picked = preferredModels?.filter(key => keys.includes(key));
   if (picked?.length) return keys.filter(key => picked.includes(key));
-  const wide = Object.values(row.baseline_views || {}).some(view => sheetWidth(view) > 6);
+  const wide = row.task === "table" && Object.values(row.baseline_views || {}).some(view => sheetWidth(view) > 6);
   return wide ? [row.models[row.target_alias]?.label ? row.target_alias :
     keys.find(key => row.models[key].label) || keys[0]] : keys;
 }
 
-function renderTablePreview(row, keys, base, views) {
+let diffPage = 0, diffIdentity = "", showDiffList = false;
+const differencesPerPage = 30;
+
+function renderDifferenceList(pair, row, visible, base, views) {
+  const aliases = [base, ...visible.filter(alias => alias !== base)].filter(Boolean);
+  const sheets = aliases.map(alias => alias === "reference" ? row.reference_view : views[alias]);
+  const indexes = sheets.map(indexCells);
+  const keys = new Set();
+  for (const index of indexes) for (const key of index.keys()) keys.add(key);
+  const differences = [];
+  function differs(a,b) {
+    return a?.text !== b?.text || a?.width !== b?.width || a?.height !== b?.height;
+  }
+  for (const key of keys) {
+    const first = indexes[0].get(key);
+    if (indexes.some(index => differs(index.get(key), first))) differences.push(key.split(",").map(Number));
+  }
+  differences.sort((a,b) => a[0]-b[0] || a[1]-b[1]);
+  const identity = JSON.stringify([state.batch, row.case_id, aliases]);
+  if (diffIdentity !== identity) diffPage = 0;
+  diffIdentity = identity;
+  const pages = Math.max(1, Math.ceil(differences.length / differencesPerPage));
+  diffPage = Math.min(pages-1, Math.max(0,diffPage));
+  const start = diffPage*differencesPerPage;
+  function value(i,r,c) {
+    const cell = indexes[i].get(r+","+c);
+    if (cell) return esc(cell.text) + (cell.width>1 || cell.height>1 ?
+      ` <small>合并 ${cell.height} 行 × ${cell.width} 列</small>` : "");
+    const rows = sheets[i]?.rows || [];
+    if (r < rows.length) {
+      for (let y=r; y>=0; y--) {
+        const cover = rows[y].find(x => y+x.height>r && x.col<=c && c<x.col+x.width);
+        if (cover) return `<small>合并自 R${y+1} C${cover.col+1}</small> ${esc(cover.text)}`;
+      }
+    }
+    return '<small>缺失</small>';
+  }
+  const headers = aliases.map((alias,i) => `<th scope="col">${esc(alias==="reference"?"参考标注":nameOf(alias))}${i===0?" · 基准":""}</th>`).join("");
+  const body = differences.slice(start,start+differencesPerPage).map(([r,c]) =>
+    `<tr><th scope="row">R${r+1} C${c+1}</th>${aliases.map((_,i)=>`<td class="${state.difference && differs(indexes[0].get(r+","+c), indexes[i].get(r+","+c)) ? "changed" : ""}">${value(i,r,c)}</td>`).join("")}</tr>`).join("");
+  pair.innerHTML = `<section class="diff-list"><header><strong>${differences.length} 处坐标差异</strong>
+    ${pages>1 ? `<button data-diff-step="-1" ${!diffPage?"disabled":""}>上一页</button> ${diffPage+1} / ${pages}
+      <button data-diff-step="1" ${diffPage+1===pages?"disabled":""}>下一页</button>` : ""}</header>
+    ${body ? `<div class="output-scroll" tabindex="0"><table class="sheet"><thead><tr><th>坐标</th>${headers}</tr></thead><tbody>${body}</tbody></table></div>` :
+      `<p class="output-empty">${aliases.length<2?"勾选另一个模型，或切换差异基准。":!keys.size?"暂无可比较的表格单元格。":"所选结果的单元格内容与合并范围一致。"}</p>`}</section>`;
+}
+
+function renderTablePreview(row, visible, base, views) {
   const pair = q("#model-pair");
-  const visible = visibleModels(row, keys);
   if (previewRow !== row) {
     previewRow = row;
     previewLeft = previewTop = 0;
   }
-  q("#visible-models").innerHTML = keys.map(key => {
-    const on = visible.includes(key);
-    return `<label><input type="checkbox" data-visible="${esc(key)}" ${on ? "checked" : ""}
-      ${on && visible.length === 1 ? "disabled" : ""}> ${esc(nameOf(key))}</label>`;
-  }).join("");
-  pair.style.setProperty("--models", visible.length);
-  const stacked = window.matchMedia("(max-width: 700px)").matches;
-  const cardWidth = pair.clientWidth / (stacked ? 1 : visible.length);
-  previewSize.width = Math.max(2, Math.min(24, Math.floor((cardWidth - 55) / 80)));
+  q("#diff-mode").checked = showDiffList;
+  if (showDiffList) {
+    q("#preview-range").hidden = true;
+    renderDifferenceList(pair,row,visible,base,views);
+    return;
+  }
   const rows = Math.max(0, ...visible.map(key => views[key]?.rows?.length || 0));
   const cols = Math.max(0, ...visible.map(key => sheetWidth(views[key])));
   function range(axis, title, start, size, total) {
@@ -353,8 +432,20 @@ function renderTablePreview(row, keys, base, views) {
   previewLeft = Math.min(previewLeft, Math.max(0, cols-1));
   q("#preview-range").innerHTML = range("height","行",previewTop,previewSize.height,rows)
     + range("width","列",previewLeft,previewSize.width,cols);
+  q("#preview-range").hidden = rows <= previewSize.height && cols <= previewSize.width;
   const page = {...previewSize, top:previewTop, left:previewLeft};
   pair.innerHTML = visible.map(key => resultCard(row,key,views[key],key !== base,false,page)).join("");
+  const panes = Array.from(pair.querySelectorAll(".output-scroll"));
+  const reflected = new WeakMap();
+  for (const pane of panes) pane.onscroll = () => {
+    const last = reflected.get(pane);
+    if (last?.top === pane.scrollTop && last.left === pane.scrollLeft) return;
+    for (const other of panes) {
+      if (other === pane) continue;
+      other.scrollTo(pane.scrollLeft, pane.scrollTop);
+      reflected.set(other, {top:other.scrollTop, left:other.scrollLeft});
+    }
+  };
 }
 
 function renderComparison() {
@@ -364,12 +455,18 @@ function renderComparison() {
   const base = q("#compare-with").value;
   const views = comparisonViews(row, base);
   const keys = [row.target_alias, ...Object.keys(row.models).filter(key => key !== row.target_alias)];
+  const visible = visibleModels(row, keys);
+  q("#visible-models").innerHTML = keys.map(key => {
+    const on = visible.includes(key);
+    return `<label><input type="checkbox" data-visible="${esc(key)}" ${on ? "checked" : ""}
+      ${on && visible.length === 1 ? "disabled" : ""}> ${esc(nameOf(key))}</label>`;
+  }).join("");
+  q("#model-pair").style.setProperty("--models", visible.length);
+  q("#adopt-model").value = alias;
   if (row.task === "table") {
-    q("#adopt-model").value = alias;
-    renderTablePreview(row, keys, base, views);
+    renderTablePreview(row, visible, base, views);
   } else {
-    q("#model-tiles").innerHTML = keys.map(key => modelTile(key, row)).join("");
-    q("#model-pair").innerHTML = keys.map(key => resultCard(row, key, views[key], key !== base, q("#only-changes")?.checked)).join("");
+    q("#model-pair").innerHTML = visible.map(key => resultCard(row, key, views[key], key !== base, q("#only-changes")?.checked)).join("");
   }
   q("#raw-output").textContent = model.raw || model.detail || "无原始输出";
   q("#raw-title").textContent = nameOf(alias) + " · 原始输出与请求";
@@ -433,12 +530,16 @@ function renderCase() {
         <button id="next" type="button">下一条</button>
       </div>
     </div>
+        <div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset>
+          <label>Pass 采用<select id="adopt-model">${Object.keys(row.models).map(key =>
+            `<option value="${esc(key)}">${esc(nameOf(key))} · ${number(row.models[key].judge?.prob_yes)}</option>`).join("")}</select></label></div>
     <section class="decision-summary">
       <div><h3>${listed?.queued ? (row.audit_sample ? "随机抽检入队" : "难例入队") : "未入审核队列"} · 判定依据</h3><div class="chips">${badges}
         ${row.audit_sample && row.reasons.length ? '<span class="reason-chip">同时命中随机抽审</span>' : ""}</div>${evidenceDetails(row)}</div>
       <div class="priority"><span>排序分</span><strong>${number(row.priority)}</strong></div>
     </section>
     <div class="comparison-layout">
+      ${row.task === "table" ? '<details class="source-fold"><summary>查看原页与区域裁图</summary>' : ""}
       <section class="panel source">
         <header class="panel-heading"><h3>原页定位</h3>
           ${row.page_geometry ? `<button type="button" data-image="${esc(page)}" data-page="true">查看原页</button>` : ""}</header>
@@ -450,17 +551,15 @@ function renderCase() {
           <img src="${esc(crop)}" alt="区域 ${esc(row.region_id)} 的裁图"><span>放大裁图</span></button>`
           : '<p class="empty">裁图文件不可用。</p>'}
       </section>
+      ${row.task === "table" ? "</details>" : ""}
       <section class="panel comparison">
         <header class="panel-heading"><h3>识别对照</h3><div class="panel-actions"><span>Jev 一致性分</span>
           ${row.task === "table" ? '<button type="button" id="open-table">放大表格</button>' : ""}</div></header>
-        ${row.task === "table" ? `<div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset>
-          <label>Pass 采用<select id="adopt-model">${Object.keys(row.models).map(key =>
-            `<option value="${esc(key)}">${esc(nameOf(key))} · ${number(row.models[key].judge?.prob_yes)}</option>`).join("")}</select></label></div>` :
-          '<div id="model-tiles" class="model-tiles"></div>'}
         <div class="diff-controls">
           <label>差异基准<select id="compare-with">${Object.keys(row.models).filter(k=>row.models[k].label).map(k=>`<option value="${esc(k)}" ${k===row.target_alias?"selected":""}>${esc(nameOf(k))}</option>`).join("")}${row.reference?'<option value="reference">参考标注</option>':""}</select></label>
           ${row.reference ? "" : "<span>无参考标注</span>"}
           ${row.task === "text" ? '<label><input id="only-changes" type="checkbox">仅看分歧</label>' : ""}
+          ${row.task === "table" ? '<label><input id="diff-mode" type="checkbox">只看差异格</label>' : ""}
           <label><input id="difference" type="checkbox" checked>高亮差异</label>
         </div>
         ${row.task === "table" ? '<nav id="preview-range" aria-label="表格预览范围"></nav>' : ""}
@@ -738,10 +837,9 @@ q("#inspection").addEventListener("click", event => {
   if (!button || !state.case) return;
   if (button.id === "previous") changeCase(-1);
   if (button.id === "next") changeCase(1);
-  if (button.dataset.model && !state.saving) {
-    state.compare = button.dataset.model;
+  if (button.dataset.diffStep) {
+    diffPage += Number(button.dataset.diffStep);
     renderComparison();
-    [...q("#model-tiles").children].find(tile => tile.dataset.model === state.compare)?.focus();
   }
   if (button.dataset.move) {
     const axis = button.dataset.move, dir = Number(button.dataset.dir);
@@ -768,6 +866,10 @@ q("#inspection").addEventListener("click", event => {
   }
 });
 q("#inspection").addEventListener("change", event => {
+  if (event.target.id === "diff-mode") {
+    showDiffList = event.target.checked;
+    renderComparison();
+  }
   if (event.target.dataset.visible) {
     preferredModels = Array.from(q("#visible-models").querySelectorAll(":checked"), input => input.dataset.visible);
     try { localStorage.setItem(previewKey, JSON.stringify(preferredModels)); } catch {}
@@ -788,13 +890,6 @@ q("#inspection").addEventListener("change", event => {
     const row = state.case;
     fetchComparison(row,event.target.value).then(() => { if (state.case === row) renderComparison(); }).catch(e=>notice(e.message,true));
   }
-});
-let previewFrame;
-window.addEventListener("resize", () => {
-  cancelAnimationFrame(previewFrame);
-  previewFrame = requestAnimationFrame(() => {
-    if (state.case?.task === "table" && q("#preview-range") && q("#model-pair").clientWidth) renderComparison();
-  });
 });
 q("#table-layout").addEventListener("change", updateTableDialog);
 q("#table-zoom").addEventListener("change", updateTableDialog);
