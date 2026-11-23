@@ -122,3 +122,59 @@ class ManagerTests(unittest.TestCase):
             unload.assert_called_once_with("ovis")
             self.assertEqual(manager.models["ovis"]["display_name"], "Ovis Lab")
             self.assertEqual(manager.models["ovis"]["url"], "http://127.0.0.1:18102/v1")
+
+    def test_model_settings_round_trip_and_unload_changed_service(self):
+        from rsi_ocr.manager import Manager, ModelSettings
+
+        @contextmanager
+        def session(*args):
+            yield [Mock(poll=lambda: None)]
+
+        with TemporaryDirectory() as directory, patch("rsi_ocr.manager.model_session", session):
+            path = Path(directory) / "settings.yaml"
+            path.write_text(Path("configs/import.yaml").read_text())
+            base = Path("configs/default.yaml")
+            manager = Manager(load_config(path), base, 8520, path)
+            manager.set_mode("managed")
+            manager.load("jev", Path(directory))
+            manager.load("paddle", Path(directory))
+            weights = Path(directory) / "new-ovis"
+            manager.set_deployment("managed", {
+                "jev": ModelSettings(enabled=False, path="MiniCPM-OCR-Jev", gpu=""),
+                "ovis": ModelSettings(enabled=True, path=str(weights), gpu="2"),
+            })
+            settings = load_config(path)
+            reloaded = Manager(settings, base, 8520, path)
+            self.assertEqual(set(manager.sessions), {"paddle"})
+            self.assertEqual(manager.models["jev"]["status"], "disabled")
+            self.assertIsNone(reloaded.config["mining"]["judge"])
+            self.assertEqual(reloaded.models["ovis"]["path"], str(weights))
+            self.assertEqual(reloaded.config["models"]["ovis"]["launch"]["env"]["CUDA_VISIBLE_DEVICES"], "2")
+            self.assertEqual(settings["deployment"]["models"]["jev"]["render_port"], 18500)
+            with self.assertRaisesRegex(ValueError, "已在模型设置中关闭"):
+                manager.enqueue("start", "jev")
+            saved = path.read_text()
+            with self.assertRaisesRegex(ValueError, "必须启用"):
+                manager.set_deployment("managed", {
+                    "paddle": ModelSettings(enabled=False, path="paddleocr-vl-16", gpu="0"),
+                })
+            self.assertEqual(path.read_text(), saved)
+            self.assertTrue(manager.models["paddle"]["enabled"])
+            manager.unload_all()
+
+    def test_managed_inference_with_only_paddle(self):
+        from rsi_ocr.manager import Manager
+
+        with TemporaryDirectory() as directory:
+            settings = load_config("configs/import.yaml")
+            settings["output_root"] = directory
+            settings["deployment"]["mode"] = "managed"
+            for alias in ("oxr", "ovis", "jev"):
+                settings["deployment"]["models"][alias]["enabled"] = False
+            manager = Manager(settings, Path("configs/default.yaml"), 8520)
+            with patch.object(manager, "is_ready", return_value=True) as ready, patch(
+                "rsi_ocr.manager.render_pages", return_value=Path("pages.jsonl")
+            ), patch("rsi_ocr.manager.run_local") as run:
+                manager.infer({"value": directory})
+            ready.assert_called_once_with("paddle")
+            self.assertEqual([call.kwargs["stage"] for call in run.call_args_list], ["paddle", "mine"])

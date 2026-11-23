@@ -4,7 +4,7 @@ const q = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, character => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[character]));
-const names = {paddle: "PaddleOCR‑VL", oxr: "OXR‑1.0", ovis: "OvisOCR3"};
+const names = {paddle: "PaddleOCR‑VL", oxr: "OXR‑1.0", ovis: "OvisOCR3", jev: "Jev"};
 const tasks = {text: "文字", table: "表格"};
 const statuses = {pending: "未复核", approved: "Pass", rejected: "Not pass", needs_check: "待核查"};
 const reasons = {
@@ -1161,7 +1161,7 @@ async function refreshRuntime() {
   const panel = q("#runtime");
   panel.hidden = false;
   const jobs = status.jobs || [], models = Object.entries(status.models || {});
-  const labels = {offline:"离线", starting:"加载中", healthy:"健康", unhealthy:"探测失败", failed:"启动失败", stopping:"释放中"};
+  const labels = {disabled:"已关闭", offline:"离线", starting:"加载中", healthy:"健康", unhealthy:"探测失败", failed:"启动失败", stopping:"释放中"};
   q("#runtime-summary").textContent = status.connected
     ? `模型后台 · ${jobs.length ? jobs.length + " 项任务" : "空闲"}` : "模型后台 · 未连接";
   q("#runtime-detail").innerHTML = models.map(([alias,model]) =>

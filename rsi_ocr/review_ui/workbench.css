@@ -375,6 +375,17 @@ dialog::backdrop { background: #101b34bb; }
 
 .deployment-settings { display:grid; gap:10px; padding:18px; margin-bottom:14px; }
 .deployment-settings p,.rules-heading + p { color:var(--muted); font-size:.88rem; }
+#deployment-fields { display:grid; gap:12px; justify-items:start; border:0; padding:0; min-width:0; }
+#deployment-models { display:grid; gap:8px; width:100%; }
+.deployment-model { display:grid; grid-template-columns: minmax(120px,1fr) minmax(160px,3fr) minmax(85px,1fr);
+  gap:12px; align-items:center; padding:10px; border:1px solid var(--line); border-radius:8px; }
+.deployment-model label { min-width:0; font-size:.88rem; }
+.deployment-model label > input[type="text"] { display:block; width:100%; margin-top:4px; }
+.deployment-model input[type="checkbox"] { accent-color:var(--green); }
+@media(max-width:600px) {
+  .deployment-model { grid-template-columns:minmax(0,2fr) minmax(0,1fr); }
+  .deployment-model label:first-child { grid-column:1/-1; }
+}
 .rules-heading { margin:18px 0 5px; }
 #fixed-switches label { display:flex; gap:10px; align-items:start; margin:10px 0; padding:10px; border:1px solid var(--line); border-radius:8px; font-size:.87rem; }
 #fixed-switches input { accent-color:#087766; }

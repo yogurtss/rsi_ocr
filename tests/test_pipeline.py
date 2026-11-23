@@ -145,3 +145,33 @@ class PipelineTest(unittest.TestCase):
         args, env, _ = train_command(self.config, "grpo", data, self.root / "grpo", None)
         self.assertIn("rsi_ocr_region", args)
         self.assertEqual(json.loads(env["RSI_OCR_REWARD_WEIGHTS"]), self.config["reward"])
+
+    def test_local_batch_mines_without_teachers_or_jev(self):
+        from rsi_ocr.importer import runtime_config
+        from rsi_ocr.local import run_local
+
+        settings = load_config(DEFAULT.with_name("import.yaml"))
+        for alias in ("oxr", "ovis", "jev"):
+            settings["deployment"]["models"][alias]["enabled"] = False
+        config = runtime_config(settings, DEFAULT)
+        manifest = self.root / "regions.jsonl"
+        write_rows(manifest, [
+            {"doc_id": "d", "page_id": 0, "region_id": "t", "image": "block.png", "task": "text",
+             "target": {"status": "ok", "raw": "Paddle output", "format": "text"}},
+        ])
+        started = []
+
+        @contextmanager
+        def session(alias, output):
+            started.append(alias)
+            yield
+
+        output = self.root / "production"
+        with patch.object(Service, "request") as upstream:
+            run_local(config, self.root, [(manifest, output)], session=session)
+            upstream.assert_not_called()
+        self.assertEqual(started, ["paddle"])
+        row, = read_rows(output / "evidence.jsonl")
+        self.assertEqual(set(row["models"]), {"paddle"})
+        self.assertEqual(row["models"]["paddle"]["raw"], "Paddle output")
+        self.assertIsNone(row["priority"])

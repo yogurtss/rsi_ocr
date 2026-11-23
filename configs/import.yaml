@@ -1,6 +1,4 @@
 # 从仓库根目录运行。相对路径从当前工作目录解析。
-model_root: /mnt/g/models       # Windows 的 G:\models；也可指向 runs/model-cache
-minicpm_repo: runs/MiniCPM-OCR  # Jev 官方渲染服务的源码目录
 output_root: runs/imports       # 默认在这里创建 UTC 时间戳批次
 extensions: [.pdf, .png, .jpg, .jpeg]  # 可按需缩减；忽略扩展名大小写
 recursive: true                 # 文件夹模式同时处理子目录
@@ -31,7 +29,9 @@ manager_port: 8520
 input_path: data/inbox
 deployment:
   mode: on_demand               # on_demand 按需轮换；managed 由 CLI 启停，多模型可同时常驻
-  gpu: "0"                     # CUDA 设备编号，单卡依次加载模型
+  model_root: /mnt/g/models    # Windows 的 G:\models；也可指向 runs/model-cache
+  minicpm_repo: runs/MiniCPM-OCR  # Jev 官方渲染服务的源码目录
+  gpu: "0"                     # 模型省略 gpu 时使用此设备
   gpu_memory: 0.65             # 每个 vLLM 服务的显存占用比例
   max_sequences: 4             # 同时处理的最大序列数
   layout_path: PP-DocLayoutV3  # 版面检测权重，相对于 model_root
@@ -40,7 +40,7 @@ deployment:
     # 各模型可覆盖 gpu、gpu_memory、max_sequences 和 tensor_parallel。
     # 双卡例：gpu: "2,3", tensor_parallel: 2, gpu_memory: 0.80。
     # path 相对于 model_root，也可填写绝对路径。context 为最大上下文 token 数。
-    paddle: {path: paddleocr-vl-16, port: 8100, context: 12288}
-    oxr:    {path: OXR-1.0, port: 8080, context: 16384}
-    ovis:   {path: OvisOCR3, port: 8102, context: 16384}
-    jev:    {path: MiniCPM-OCR-Jev, port: 18499, render_port: 18500, context: 16384}
+    paddle: {enabled: true, path: paddleocr-vl-16, gpu: "0", port: 8100, context: 12288}  # 必须启用
+    oxr:    {enabled: true, path: OXR-1.0, gpu: "0", port: 8080, context: 16384}
+    ovis:   {enabled: true, path: OvisOCR3, gpu: "0", port: 8102, context: 16384}
+    jev:    {enabled: true, path: MiniCPM-OCR-Jev, gpu: "0", port: 18499, render_port: 18500, context: 16384}

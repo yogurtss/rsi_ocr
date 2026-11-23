@@ -76,9 +76,15 @@
     <header class="settings-heading"><div><h2>识别流程与阈值</h2><p>沿着同一块裁图，查看模型如何识别、评分和筛选难例。</p></div>
       <span id="settings-batch"></span></header>
     <section class="deployment-settings panel">
-      <div><h3>模型部署</h3><p>按需模式逐个加载并释放模型。CLI 常驻模式复用手动启动的服务，OXR 与 Ovis 并行转录。</p></div>
-      <div><label>运行方式 <select id="deployment-mode" disabled><option value="on_demand">按需加载</option><option value="managed">CLI 多模型常驻</option></select></label>
-      <button id="save-mode" disabled>保存部署模式</button></div><p id="mode-status" role="status"></p>
+      <div><h3>模型部署</h3><p>按需模式逐个加载已启用的模型。CLI 常驻模式复用手动启动的服务。</p></div>
+      <form id="deployment-form">
+        <fieldset id="deployment-fields" disabled>
+          <label>运行方式 <select id="deployment-mode"><option value="on_demand">按需加载</option><option value="managed">CLI 多模型常驻</option></select></label>
+          <div id="deployment-models"></div>
+          <button id="save-deployment" disabled>保存模型设置</button>
+        </fieldset>
+      </form>
+      <p id="deployment-status" role="status"></p>
     </section>
     <section class="flow-sheet" aria-label="识别与难例筛选流程">
       <div class="flow-unit"><h3>版面与裁图</h3><div class="flow-tile"><strong>PDF / 图片</strong><span>Paddle 版面检测</span><b>文字或表格裁图</b></div></div>

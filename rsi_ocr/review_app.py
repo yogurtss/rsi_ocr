@@ -266,6 +266,17 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
 
+    @app.put("/api/runtime/deployment")
+    def save_deployment(settings: dict):
+        if manager_port is None:
+            raise HTTPException(409, "此工作台未连接模型后台")
+        from .pageproof import endpoint
+        try:
+            return endpoint(manager_port, "/deployment", settings, timeout=120)
+        except ValueError as error:
+            detail = str(error)
+            raise HTTPException(409, detail) from error
+
     def original_batch(batch_id):
         if batch_id not in batches:
             raise HTTPException(404, "批次不存在")

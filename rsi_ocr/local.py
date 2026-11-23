@@ -1,13 +1,14 @@
-"""Run local OCR services one at a time and reuse their cached responses."""
+"""Configure local OCR services and reuse their cached responses."""
 import json
 import os
 import signal
 import subprocess
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 from rsi_ocr.capture import capture_pages
+from rsi_ocr.config import load_config
 from rsi_ocr.mining import mine, warm
 from rsi_ocr.service import Service, ServiceError, command
 from rsi_ocr.store import json_text
@@ -108,28 +109,60 @@ def model_session(config, alias, output, cancelled=lambda: False):
         yield processes
 
 
+def mining_models(policy):
+    aliases = [policy["target"], *policy["teachers"]]
+    if judge := policy.get("judge"):
+        aliases.append(judge)
+    return aliases
+
+
+def apply_model_selection(config, policy):
+    def enabled(alias):
+        return config["models"][alias].get("enabled", True)
+
+    judge = policy.get("judge")
+    config["mining"] = {**policy, "teachers": [alias for alias in policy["teachers"] if enabled(alias)],
+                        "judge": judge if judge and enabled(judge) else None}
+
+
 def run_local(config, output, jobs, pages=None, stage="all", session=None):
     output.mkdir(parents=True, exist_ok=True)
     policy = config["mining"]
     target = policy["target"]
     if config["models"][target].get("local_weights"):
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")
-    for alias in [target, *policy["teachers"], policy["judge"]]:
+
+    def use_model(alias):
+        print(f"Starting {alias}. Log: {output / (alias + '.log')}", flush=True)
+        return session(alias, output) if session else model_session(config, alias, output)
+
+    for alias in [target, *policy["teachers"]]:
         if stage not in ("all", alias):
             continue
-        print(f"Starting {alias}. Log: {output / (alias + '.log')}", flush=True)
-        with (session(alias, output) if session else model_session(config, alias, output)):
+        with use_model(alias):
             if alias == target and pages:
                 capture_pages(config, pages.resolve(), output / "capture")
             for manifest, run in jobs:
-                if alias == policy["judge"]:
-                    summary = mine(config, manifest, run, cached_readers=True)
-                    print(f"{run.name} {json_text(summary)}", flush=True)
-                else:
-                    counts = warm(config, manifest, run, alias)
-                    print(f"{alias} {run.name} {json_text(counts)}", flush=True)
-                    if counts.get("service_error"):
-                        raise RuntimeError(f"{alias} returned service errors for {run.name}; see {output}")
+                counts = warm(config, manifest, run, alias)
+                print(f"{alias} {run.name} {json_text(counts)}", flush=True)
+                if counts.get("service_error"):
+                    raise RuntimeError(f"{alias} returned service errors for {run.name}; see {output}")
+    judge = policy.get("judge")
+    if stage in ("all", judge or "mine"):
+        with (use_model(judge) if judge else nullcontext()):
+            for manifest, run in jobs:
+                summary = mine(config, manifest, run, cached_readers=True)
+                print(f"{run.name} {json_text(summary)}", flush=True)
+
+
+def local_config(settings, base):
+    config = load_config(base)
+    deployment = settings.get("deployment", {})
+    root = deployment.get("model_root", settings.get("model_root", "/mnt/g/models"))
+    minicpm = deployment.get("minicpm_repo", settings.get("minicpm_repo", "runs/MiniCPM-OCR"))
+    configure_models(config, Path(root).expanduser().resolve(), Path(minicpm).expanduser(), deployment)
+    config["mining"].update(settings["mining"])
+    return config
 
 
 def configure_models(config, root, minicpm, deployment=None):
@@ -146,8 +179,19 @@ def configure_models(config, root, minicpm, deployment=None):
     ]:
         launch = models[alias]["launch"]
         options = deployment.get("models", {}).get(alias, {})
+        enabled = options.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{alias}.enabled 需为 true 或 false")
+        if alias == "paddle" and not enabled:
+            raise ValueError("PaddleOCR-VL 必须启用")
+        models[alias]["enabled"] = enabled
         models[alias]["display_name"] = options.get("display_name")
-        model_dir = root / options.get("path", directory)
+        path = options.get("path", directory)
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(f"{alias} 的权重路径不能为空")
+        model_dir = root / Path(path).expanduser()
+        models[alias]["configured_path"] = path
+        models[alias]["configured_gpu"] = str(options["gpu"]) if "gpu" in options else ""
         length = options.get("context", length)
         if "revision" in options:
             models[alias]["revision"] = options["revision"]

@@ -18,10 +18,7 @@ function initSettings() {
   q("#settings-batch").textContent = data ? q("#batch").selectedOptions[0]?.text || state.batch : "尚未选择批次";
   q("#settings-empty").hidden = !!data;
   q("#tuning").hidden = !data;
-  const readers = policy ? [policy.target, ...policy.teachers] : ["paddle","oxr","ovis"];
-  if (policy?.strong_budget && policy.strong_teacher) readers.push(policy.strong_teacher);
-  q("#flow-readers").innerHTML = readers.map((key, i) =>
-    `<div><strong>${esc(nameOf(key))}</strong><small>${i ? (key === policy?.strong_teacher ? "按需复读" : "候选") : "基线"}</small></div>`).join("");
+  showFlowReaders();
   document.querySelectorAll("[data-rule]").forEach(button => {
     button.disabled = !data;
     button.setAttribute("aria-pressed","false");
@@ -154,29 +151,88 @@ const fixedDescriptions = {
   format_invalid: ["表格格式无效", "Paddle 输出无法按声明的表格格式解析，例如合并单元格占位不合法。"],
   judge_precheck_reject: ["Jev 预检拒绝", "Jev 在正式评分前拒绝 Paddle 转录；该状态记录在原始评分证据中。"],
 };
-let liveMode;
-async function loadDeployment() {
-  const select = q("#deployment-mode"), save = q("#save-mode");
-  select.disabled = save.disabled = true;
+let savedDeployment;
+let loadingDeployment = false;
+
+function showFlowReaders() {
+  const policy = state.data?.summary.mining;
+  const readers = policy ? [policy.target, ...policy.teachers] : ["paddle", "oxr", "ovis"].filter(
+    alias => savedDeployment?.models[alias]?.enabled !== false);
+  if (policy?.strong_budget && policy.strong_teacher) readers.push(policy.strong_teacher);
+  q("#flow-readers").innerHTML = readers.map((key, i) =>
+    `<div><strong>${esc(nameOf(key))}</strong><small>${i ? (key === policy?.strong_teacher ? "按需复读" : "候选") : "基线"}</small></div>`).join("");
+}
+
+function readDeployment() {
+  const models = Object.fromEntries([...document.querySelectorAll(".deployment-model")].map(row => [
+    row.dataset.model, {
+      enabled: row.querySelector("[name=enabled]").checked,
+      path: row.querySelector("[name=path]").value.trim(),
+      gpu: row.querySelector("[name=gpu]").value.trim(),
+    },
+  ]));
+  return {mode:q("#deployment-mode").value, models};
+}
+
+function updateDeploymentButton() {
+  const current = readDeployment();
+  q("#save-deployment").disabled = !savedDeployment || !Object.values(current.models).every(model => model.path)
+    || JSON.stringify(current) === JSON.stringify(savedDeployment);
+}
+
+async function loadDeployment(message) {
+  if (loadingDeployment || (savedDeployment && JSON.stringify(readDeployment()) !== JSON.stringify(savedDeployment))) return;
+  loadingDeployment = true;
+  const fields = q("#deployment-fields"), status = q("#deployment-status");
+  fields.disabled = true;
   try {
     const runtime = await api("/api/runtime");
-    if (!runtime.connected || !runtime.mode) throw new Error("通过 glyphstack studio 连接后台后可修改部署模式。");
-    select.value = liveMode = runtime.mode;
-    select.disabled = false;
-    q("#mode-status").textContent = "模式保存到后台使用的配置文件，立即生效。";
-  } catch (error) { q("#mode-status").textContent = error.message; }
-}
-q("#deployment-mode").onchange = e => { q("#save-mode").disabled = e.target.value === liveMode; };
-q("#save-mode").onclick = async () => {
-  const select = q("#deployment-mode"), mode = select.value;
-  select.disabled = q("#save-mode").disabled = true;
-  try {
-    await api("/api/runtime/deployment/" + mode,{method:"PUT"});
-    liveMode = mode;
-    q("#mode-status").textContent = "已保存部署模式。";
+    if (!runtime.connected || !runtime.mode) throw new Error("通过 glyphstack studio 连接后台后可修改模型设置。");
+    q("#deployment-mode").value = runtime.mode;
+    q("#deployment-models").innerHTML = Object.entries(runtime.models).map(([alias, model]) =>
+      `<div class="deployment-model" data-model="${esc(alias)}">
+        <label><input type="checkbox" name="enabled" ${model.enabled !== false ? "checked" : ""}
+          ${alias === "paddle" ? "disabled" : ""}> <strong>${esc(model.display_name || nameOf(alias))}</strong>
+          ${alias === "paddle" ? "<small>必开</small>" : ""}</label>
+        <label>权重路径<input type="text" name="path" value="${esc(model.configured_path ?? model.path)}" required></label>
+        <label>GPU<input type="text" name="gpu" value="${esc(model.configured_gpu)}" placeholder="${esc(model.gpu)}"></label>
+      </div>`).join("");
+    savedDeployment = readDeployment();
+    fields.disabled = false;
+    status.textContent = message || "相对路径基于 YAML 的 model_root。GPU 留空时使用默认设备。";
+    showFlowReaders();
   } catch (error) {
-    select.value = liveMode;
-    q("#mode-status").textContent = error.message;
-  } finally { select.disabled = false; }
+    status.textContent = message ? message + " " + error.message : error.message;
+  } finally {
+    loadingDeployment = false;
+    updateDeploymentButton();
+  }
+}
+
+q("#deployment-form").oninput = updateDeploymentButton;
+q("#deployment-form").onsubmit = async event => {
+  event.preventDefault();
+  if (q("#save-deployment").disabled) return;
+  const fields = q("#deployment-fields"), status = q("#deployment-status");
+  const current = readDeployment();
+  const models = Object.fromEntries(Object.entries(current.models).filter(([alias, model]) =>
+    JSON.stringify(model) !== JSON.stringify(savedDeployment.models[alias])));
+  loadingDeployment = fields.disabled = q("#save-deployment").disabled = true;
+  status.textContent = "正在保存模型设置…";
+  try {
+    await api("/api/runtime/deployment", {method:"PUT", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({mode:current.mode, models})});
+    savedDeployment = current;
+    loadingDeployment = false;
+    await loadDeployment(current.mode === "managed"
+      ? "已保存到 YAML。变更过的服务已卸载，可通过 CLI 启动。"
+      : "已保存到 YAML。下次运行将按新设置加载模型。");
+  } catch (error) {
+    status.textContent = error.message;
+    fields.disabled = false;
+  } finally {
+    loadingDeployment = false;
+    updateDeploymentButton();
+  }
 };
 q("#fixed-switches").onchange = schedulePreview;

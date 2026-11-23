@@ -63,13 +63,15 @@ glyphstack stop ovis --port 8520           # 命令行卸载模型
 | 参数 | 用途 |
 |---|---|
 | `manager_port`、`port` | 终端后台端口与前端端口，默认分别为 8520、8517。 |
-| `model_root`、`minicpm_repo` | 权重根目录和 Jev 源码目录。WSL 下默认读取 `/mnt/g/models`。 |
-| `deployment` | GPU 编号、显存比例、最大并发序列数；各模型的权重目录、服务端口和上下文长度，以及 Jev 渲染端口。 |
+| `deployment` | 运行方式、权重根目录 `model_root`、Jev 源码目录 `minicpm_repo`、版面检测权重和默认 GPU 设置。 |
+| `deployment.models` | 各模型的启用状态 `enabled`、权重目录 `path`、GPU、服务端口和上下文长度，以及 Jev 渲染端口。 |
 | `input_path`、`output_root` | 默认输入文件或目录、结果批次根目录。复核时保留批次内的图片和裁图。 |
 | `extensions`、`recursive`、`dpi` | 输入类型、递归开关、PDF 渲染分辨率。 |
 | `mining` | 难例触发阈值、排序权重、抽检比例和入队配额。 |
 
-模型可分别覆盖部署参数。例如配置 `deployment.models.ovis` 为 `{path: OvisOCR3, port: 8102, context: 16384, gpu: "1", gpu_memory: 0.75, max_sequences: 4}`，就会把 Ovis 部署到 GPU 1。跨卡模型可同时设置 `gpu: "2,3"` 和 `tensor_parallel: 2`。修改单个模型配置后，选中其卡片按 **T** 即可重读配置并重启。
+在 **流程与设置 → 模型部署** 可分别修改权重路径、GPU 和启用状态，保存后写回后台使用的 YAML。PaddleOCR-VL 必须启用，OXR、OvisOCR3 和 Jev 可独立关闭。权重路径可以是绝对路径，也可以相对于 `deployment.model_root`，GPU 留空则继承部署默认值。关闭 Jev 后批次仍会筛选难例并生成复核结果。
+
+例如将 `deployment.models.ovis` 设为 `{enabled: true, path: OvisOCR3, port: 8102, context: 16384, gpu: "1", gpu_memory: 0.75, max_sequences: 4}`，Ovis 就会部署到 GPU 1。跨卡模型可同时设置 `gpu: "2,3"` 和 `tensor_parallel: 2`。在页面保存时，受变更影响的服务会卸载，常驻模式下可用 CLI 重新启动。直接编辑 YAML 后，可选中对应卡片按 **T** 重读配置，启用的模型会重启。
 
 ## 后台数据怎么产生
 

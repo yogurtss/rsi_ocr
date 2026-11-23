@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_config, resolve_config
-from .local import configure_models, run_local
+from .local import apply_model_selection, local_config, run_local
 from .store import atomic_output, write_rows
 
 
@@ -85,10 +85,8 @@ def process_inputs(source, settings_path, config_path, out, import_only):
 
 
 def runtime_config(settings, config_path):
-    config = load_config(config_path)
-    configure_models(config, Path(settings["model_root"]).resolve(), Path(settings["minicpm_repo"]),
-                     settings.get("deployment"))
-    config["mining"].update(settings["mining"])
+    config = local_config(settings, config_path)
+    apply_model_selection(config, config["mining"])
     return resolve_config(config, config_path.parent)
 
 

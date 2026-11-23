@@ -1,23 +1,26 @@
-"""Single-GPU service ownership and local inference queue for PageProof."""
+"""Local model service ownership and inference queue for PageProof."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
 from tempfile import TemporaryDirectory
-from threading import Event, Lock, Thread
+from threading import Event, RLock, Thread
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .traffic import RequestMeter, open_journal, recent, record
 from .config import load_config, resolve_config
 from .importer import render_pages
-from .local import check_checkpoint, configure_models, endpoints, healthy, model_session, run_local
+from .local import apply_model_selection, check_checkpoint, endpoints, healthy, local_config, mining_models, model_session, run_local
+from .store import atomic_output
 
 
 class Manager:
@@ -30,20 +33,16 @@ class Manager:
         self.port = port
         self.root = Path(settings["output_root"]).resolve()
         self.default_input = Path(settings.get("input_path", "data/inbox")).resolve()
-        self.config = load_config(base)
-        configure_models(self.config, Path(settings["model_root"]).resolve(), Path(settings["minicpm_repo"]),
-                         settings.get("deployment"))
-        self.config["mining"].update(settings["mining"])
+        self.config = local_config(settings, base)
         self.base = base
-        policy = self.config["mining"]
-        self.aliases = [policy["target"], *policy["teachers"], policy["judge"]]
-        self.models = {}
+        self.policy = self.config["mining"]
+        apply_model_selection(self.config, self.policy)
+        self.aliases = mining_models(self.policy)
         self.validate_ports(self.config["models"])
-        for alias in self.aliases:
-            self.models[alias] = {**self.card(self.config["models"][alias]), "status":"offline", "detail":""}
+        self.models = {alias: {**self.card(self.config["models"][alias]), "detail": ""} for alias in self.aliases}
         self.journal_dir = None
         self.journal_path = None
-        self.lock = Lock()
+        self.lock = RLock()
         self.closing = Event()
         self.queue = Queue()
         self.jobs = {}
@@ -54,12 +53,15 @@ class Manager:
     @staticmethod
     def card(spec):
         return {"model": spec["model"], "display_name": spec.get("display_name"), "url": spec["base_url"], "gpu": spec["gpu"],
-                "gpu_memory": spec["gpu_memory"], "path": spec["local_weights"]}
+                "gpu_memory": spec["gpu_memory"], "path": spec["local_weights"], "enabled": spec["enabled"],
+                "configured_path": spec["configured_path"], "configured_gpu": spec["configured_gpu"],
+                "status": "offline" if spec["enabled"] else "disabled"}
 
     def validate_ports(self, models):
         ports = [self.port, self.settings["port"]]
         for alias in self.aliases:
-            ports.extend(urlsplit(s["base_url"]).port for s, _ in endpoints(models[alias]))
+            if models[alias]["enabled"]:
+                ports.extend(urlsplit(s["base_url"]).port for s, _ in endpoints(models[alias]))
         if len(ports) != len(set(ports)) or not all(isinstance(p, int) and 0 < p < 65536 for p in ports):
             raise ValueError("后台、前端及模型的端口必须有效且互不重复")
 
@@ -69,21 +71,21 @@ class Manager:
                 self.unload(alias)
             return
         settings = load_config(self.config_path)
-        config = load_config(self.base)
-        configure_models(config, Path(settings["model_root"]).resolve(), Path(settings["minicpm_repo"]),
-                         settings.get("deployment"))
+        config = local_config(settings, self.base)
         replacements = {a: config["models"][a] for a in aliases}
         self.validate_ports({**self.config["models"], **replacements})
         for spec in replacements.values():
-            check_checkpoint(spec)
+            if spec["enabled"]:
+                check_checkpoint(spec)
         for alias in aliases:
             self.unload(alias)
         with self.lock:
             for alias, spec in replacements.items():
                 self.config["models"][alias] = spec
-                self.models[alias].update(self.card(spec))
+                self.models[alias].update(self.card(spec), detail="")
             if "paddle" in replacements:
                 self.config["capture"] = config["capture"]
+            apply_model_selection(self.config, self.policy)
 
     def start(self):
         self.journal_dir = TemporaryDirectory(prefix="glyphstack-")
@@ -129,6 +131,8 @@ class Manager:
                 raise ValueError("后台正在关闭")
             if action == "start" and value == "all" and self.mode != "managed":
                 raise ValueError("start all 需要 CLI 常驻模式")
+            if action == "start" and value != "all" and not self.models[value]["enabled"]:
+                raise ValueError(f"{value} 已在模型设置中关闭")
             self.jobs[job["id"]] = job
             self.queue.put(job)
         return job["id"]
@@ -143,20 +147,62 @@ class Manager:
         with self.lock:
             if self.mode == mode:
                 return
-            if any(j["status"] in {"queued", "running"} for j in self.jobs.values()):
-                raise ValueError("请等待当前任务和排队操作完成后切换模式")
-            if mode == "on_demand" and len(self.sessions) > 1:
-                raise ValueError("请先用 CLI 停止多余模型，仅保留一个模型后切换")
+            self.validate_settings_change(mode)
             if self.config_path:
-                from ruamel.yaml import YAML
-                from .store import atomic_output
-                yaml = YAML()
-                yaml.preserve_quotes = True
-                config = yaml.load(self.config_path)
+                yaml, config = self.read_settings()
                 config.setdefault("deployment", {})["mode"] = mode
-                with atomic_output(self.config_path) as tmp:
-                    yaml.dump(config, tmp)
-                    tmp.chmod(self.config_path.stat().st_mode)
+                self.write_settings(yaml, config)
+            self.mode = mode
+
+    def read_settings(self):
+        from ruamel.yaml import YAML
+
+        yaml = YAML()
+        yaml.preserve_quotes = True
+        return yaml, yaml.load(self.config_path)
+
+    def write_settings(self, yaml, settings):
+        with atomic_output(self.config_path) as tmp:
+            yaml.dump(settings, tmp)
+            tmp.chmod(self.config_path.stat().st_mode)
+
+    def validate_settings_change(self, mode, unloading=()):
+        if any(j["status"] in {"queued", "running"} for j in self.jobs.values()):
+            raise ValueError("请等待当前任务和排队操作完成后保存模型设置")
+        if mode == "on_demand" and len(self.sessions.keys() - set(unloading)) > 1:
+            raise ValueError("请先用 CLI 停止多余模型，仅保留一个模型后切换")
+
+    def set_deployment(self, mode, changes):
+        with self.lock:
+            if not self.config_path:
+                raise ValueError("后台缺少 YAML 配置路径")
+            if changes.keys() - self.models.keys():
+                raise ValueError("未知模型")
+            yaml, settings = self.read_settings()
+            deployment = settings.setdefault("deployment", {})
+            deployment["mode"] = mode
+            options = deployment.setdefault("models", {})
+            for alias, change in changes.items():
+                model = options.setdefault(alias, {})
+                model.update(enabled=change.enabled, path=change.path.strip())
+                if gpu := change.gpu.strip():
+                    model["gpu"] = gpu
+                else:
+                    model.pop("gpu", None)
+            config = local_config(settings, self.base)
+            self.validate_ports(config["models"])
+            changed = [alias for alias in self.aliases if config["models"][alias] != self.config["models"][alias]]
+            if config["capture"] != self.config["capture"] and "paddle" not in changed:
+                changed.append("paddle")
+            self.validate_settings_change(mode, changed)
+            self.write_settings(yaml, settings)
+            for alias in changed:
+                self.unload(alias)
+                spec = config["models"][alias]
+                self.config["models"][alias] = spec
+                self.models[alias].update(self.card(spec), detail="")
+            self.config["capture"] = config["capture"]
+            apply_model_selection(self.config, self.policy)
             self.mode = mode
 
     def unload(self, alias):
@@ -181,6 +227,8 @@ class Manager:
             healthy(s, path) for s, path in endpoints(self.config["models"][alias]))
 
     def load(self, alias, output):
+        if not self.models[alias]["enabled"]:
+            raise ValueError(f"{alias} 已在模型设置中关闭")
         if self.is_ready(alias):
             return
         if self.mode == "on_demand":
@@ -210,7 +258,7 @@ class Manager:
 
     def infer(self, job):
         if self.mode == "managed":
-            missing = [alias for alias in self.aliases if not self.is_ready(alias)]
+            missing = [alias for alias in mining_models(self.config["mining"]) if not self.is_ready(alias)]
             if missing:
                 raise ValueError("CLI 常驻模式需要先启动这些模型：" + ", ".join(missing))
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -218,7 +266,8 @@ class Manager:
         output.mkdir(parents=True)
         self.update(job, output=str(output), stage="导入页面")
         pages = render_pages(Path(job["value"]), output / "input", self.settings)
-        resolve_config(self.config, self.base.parent)
+        config = deepcopy(self.config)
+        resolve_config(config, self.base.parent)
 
         @contextmanager
         def use_model(alias, directory):
@@ -232,23 +281,24 @@ class Manager:
 
         jobs = [(output / "capture/regions.jsonl", output / "production")]
         if self.mode == "managed":
-            policy = self.config["mining"]
+            policy = config["mining"]
 
             def stage(alias):
                 if self.closing.is_set():
                     raise RuntimeError("后台正在关闭")
-                run_local(self.config, output, jobs, pages, stage=alias, session=lambda *_: nullcontext())
+                run_local(config, output, jobs, pages, stage=alias, session=lambda *_: nullcontext())
 
             self.update(job, stage="版面与基线识别")
             stage(policy["target"])
-            self.update(job, stage="教师模型并行转录")
-            with ThreadPoolExecutor(max_workers=len(policy["teachers"])) as pool:
-                list(pool.map(stage, policy["teachers"]))
-            self.update(job, stage="Jev 评分与难例筛选")
-            stage(policy["judge"])
+            if policy["teachers"]:
+                self.update(job, stage="教师模型转录")
+                with ThreadPoolExecutor(max_workers=len(policy["teachers"])) as pool:
+                    list(pool.map(stage, policy["teachers"]))
+            self.update(job, stage="Jev 评分与难例筛选" if policy["judge"] else "难例筛选")
+            stage(policy["judge"] or "mine")
             return
         try:
-            run_local(self.config, output, jobs, pages,
+            run_local(config, output, jobs, pages,
                       session=use_model)
         finally:
             self.unload_all()
@@ -266,12 +316,14 @@ class Manager:
                     elif job["action"] in {"start", "restart"}:
                         directory = self.root / ".manager"
                         directory.mkdir(parents=True, exist_ok=True)
-                        aliases = self.aliases if job["value"] == "all" else [job["value"]]
+                        aliases = mining_models(self.config["mining"]) if job["value"] == "all" else [job["value"]]
                         if job["action"] == "restart":
                             if job["value"] == "all":
                                 aliases = list(self.sessions)
                             self.prepare_restart(aliases)
                         for alias in aliases:
+                            if not self.models[alias]["enabled"]:
+                                continue
                             self.update(job, stage=f"加载 {alias}")
                             self.load(alias, directory)
                     elif job["value"] == "all":
@@ -288,6 +340,17 @@ class Manager:
 class Command(BaseModel):
     action: str
     value: str | None = None
+
+
+class ModelSettings(BaseModel):
+    enabled: StrictBool
+    path: str
+    gpu: str
+
+
+class DeploymentSettings(BaseModel):
+    mode: Literal["on_demand", "managed"]
+    models: dict[str, ModelSettings]
 
 
 def manager_app(manager, terminal=None):
@@ -330,6 +393,14 @@ def manager_app(manager, terminal=None):
     def deployment(mode: str):
         try:
             manager.set_mode(mode)
+        except (ValueError, OSError) as error:
+            raise HTTPException(409, str(error)) from error
+        return {"mode": manager.mode}
+
+    @app.post("/deployment")
+    def save_deployment(settings: DeploymentSettings):
+        try:
+            manager.set_deployment(settings.mode, settings.models)
         except (ValueError, OSError) as error:
             raise HTTPException(409, str(error)) from error
         return {"mode": manager.mode}

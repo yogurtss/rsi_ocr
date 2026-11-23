@@ -115,7 +115,7 @@ def proposals(case, inputs, target_alias, policy):
 class Miner:
     def __init__(self, config, cache, base):
         self.policy = config["mining"]
-        self.models = config["models"]
+        self.models = {alias: spec for alias, spec in config["models"].items() if spec.get("enabled", True)}
         self.services = {alias: Service(spec, cache) for alias, spec in self.models.items()}
         self.base = base
 

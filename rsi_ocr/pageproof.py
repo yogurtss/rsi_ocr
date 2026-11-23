@@ -18,16 +18,17 @@ DEFAULT_SETTINGS = Path("configs/import.yaml")
 
 
 LABELS = {"offline": ("离线", "dim"), "starting": ("加载中", "yellow"), "healthy": ("健康", "green"),
+          "disabled": ("已关闭", "dim"),
           "unhealthy": ("探测失败", "red"), "failed": ("失败", "red"), "stopping": ("释放中", "yellow"),
           "running": ("执行中", "cyan"), "queued": ("排队", "yellow"), "done": ("完成", "green")}
 
 
-def endpoint(port, path, payload=None):
+def endpoint(port, path, payload=None, timeout=5):
     data = json.dumps(payload).encode() if payload is not None else None
     req = Request(f"http://127.0.0.1:{port}{path}", data=data,
                   headers={"Content-Type": "application/json", "X-PageProof-Client": "cli"})
     try:
-        with urlopen(req, timeout=5) as response:
+        with urlopen(req, timeout=timeout) as response:
             return json.load(response)
     except HTTPError as error:
         raise ValueError(json.load(error).get("detail", str(error))) from error
