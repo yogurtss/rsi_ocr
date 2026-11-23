@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from importlib.util import find_spec
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier, Event
 from unittest.mock import Mock, patch
 
 from rsi_ocr.config import load_config
@@ -11,6 +12,16 @@ from rsi_ocr.config import load_config
 
 @unittest.skipUnless(find_spec("fastapi"), "requires quality extras")
 class ManagerTests(unittest.TestCase):
+    def wait_for_job(self, manager, job_id):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with manager.lock:
+                job = manager.jobs[job_id].copy()
+            if job["status"] in {"done", "failed"}:
+                return job
+            time.sleep(.01)
+        self.fail(f"Job did not finish: {job}")
+
     def test_queue_reuses_healthy_model_and_releases_owned_processes(self):
         from rsi_ocr.manager import Manager
 
@@ -62,26 +73,69 @@ class ManagerTests(unittest.TestCase):
             path = Path(directory) / "settings.yaml"
             path.write_text(Path("configs/import.yaml").read_text())
             settings = load_config(path)
+            settings["output_root"] = directory
             settings["deployment"]["models"]["oxr"].update(gpu="1", gpu_memory=0.42)
             manager = Manager(settings, Path("configs/default.yaml"), 8520, path)
             self.assertEqual(manager.models["oxr"]["gpu"], "1")
             self.assertEqual(manager.models["oxr"]["gpu_memory"], 0.42)
-            manager.set_mode("managed")
-            self.assertEqual(load_config(path)["deployment"]["mode"], "managed")
+            manager.start()
             try:
-                for alias in ("paddle", "oxr"):
-                    manager.load(alias, Path(directory))
-                self.assertEqual(set(manager.sessions), {"paddle", "oxr"})
-                with self.assertRaises(ValueError):
-                    manager.set_mode("on_demand")
-                manager.unload("oxr")
-                self.assertTrue(manager.is_ready("paddle"))
+                manager.set_mode("managed")
+                self.assertEqual(load_config(path)["deployment"]["mode"], "managed")
+                self.assertEqual(self.wait_for_job(manager, next(iter(manager.jobs)))["status"], "done")
+                self.assertEqual(set(manager.sessions), {"paddle", "oxr", "ovis", "jev"})
                 manager.set_mode("on_demand")
+                self.assertEqual(self.wait_for_job(manager, list(manager.jobs)[-1])["status"], "done")
+                self.assertFalse(manager.sessions)
+                self.assertEqual(load_config(path)["deployment"]["mode"], "on_demand")
             finally:
-                manager.unload_all()
+                manager.close()
+
+    def test_managed_startup_is_parallel_and_run_waits_in_queue(self):
+        from rsi_ocr.manager import Manager
+
+        launching = Barrier(3)
+        release = Event()
+
+        @contextmanager
+        def session(config, alias, output, cancelled):
+            launching.wait(timeout=3)
+            if not release.wait(timeout=3):
+                raise TimeoutError("Startup was not released")
+            yield [Mock(poll=lambda: None)]
+
+        with TemporaryDirectory() as directory, patch("rsi_ocr.manager.model_session", session), patch(
+            "rsi_ocr.manager.healthy", return_value=True
+        ), patch("rsi_ocr.manager.render_pages", return_value=Path("pages.jsonl")), patch(
+            "rsi_ocr.manager.run_local"
+        ) as run:
+            root = Path(directory)
+            settings = load_config("configs/import.yaml")
+            settings["output_root"] = str(root / "output")
+            settings["deployment"]["mode"] = "managed"
+            for alias in ("ovis", "jev"):
+                settings["deployment"]["models"][alias]["enabled"] = False
+            source = root / "scan.pdf"
+            source.touch()
+            manager = Manager(settings, Path("configs/default.yaml"), 8520)
+            manager.start()
+            try:
+                launching.wait(timeout=3)
+                models = manager.snapshot()["models"]
+                self.assertEqual({alias for alias, model in models.items() if model["status"] == "starting"},
+                                 {"paddle", "oxr"})
+                job_id = manager.enqueue("run", str(source))
+                self.assertEqual(manager.jobs[job_id]["status"], "queued")
+                run.assert_not_called()
+                release.set()
+                self.assertEqual(self.wait_for_job(manager, job_id)["status"], "done")
+                self.assertEqual([call.kwargs["stage"] for call in run.call_args_list], ["paddle", "oxr", "mine"])
+                self.assertEqual(set(manager.sessions), {"paddle", "oxr"})
+            finally:
+                release.set()
+                manager.close()
 
     def test_managed_inference_overlaps_teachers_and_keeps_services(self):
-        from threading import Barrier
         from rsi_ocr.manager import Manager
 
         stages = []

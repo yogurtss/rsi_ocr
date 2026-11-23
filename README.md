@@ -39,15 +39,16 @@ glyphstack run examples/inputs --port 8520  # 后台启动后，提交同一组�
 
 | 模式 | 服务生命周期 |
 |---|---|
-| `on_demand`（默认） | 按阶段启动，切换模型释放上一模型。任务结束释放显存。 |
-| `managed` | 用 CLI 启动所需模型并保持在线。任务复用四个健康服务，OXR 与 Ovis 并行转录，结束后模型继续常驻。 |
+| `on_demand` 串行按需（默认） | 每个批次按阶段逐个启动模型，切换时释放上一模型，批次结束释放显存。 |
+| `managed` 后台并行常驻 | 后台启动或保存常驻设置时自动并行加载已启用的模型。批次复用常驻服务，OXR 与 Ovis 可并行转录。 |
 
+两种模式都用 `glyphstack run <输入路径> --port 8520` 提交任务。常驻模型正在加载时，任务会排队等待。工作台顶部「模型后台」显示部署模式、就绪数量、各模型的 GPU 和启动错误。常驻模式需按可用显存分配各模型的 `gpu` 和 `gpu_memory`。
 
 ```bash
 glyphstack console --headless              # 无交互终端时运行后台
 glyphstack monitor --port 8520             # 连接运行中的后台，打开彩色交互面板
 glyphstack status --port 8520              # 输出模型和任务状态 JSON
-glyphstack start all --port 8520           # 常驻模式依次启动全部服务
+glyphstack start all --port 8520           # 手动并行启动常驻模式下尚未就绪的模型
 glyphstack start ovis --port 8520          # 命令行加载模型
 glyphstack restart ovis --port 8520        # 重读配置，重启指定模型
 glyphstack restart all --port 8520         # 重启当前在线的模型
@@ -71,7 +72,7 @@ glyphstack stop ovis --port 8520           # 命令行卸载模型
 
 在 **流程与设置 → 模型部署** 可分别修改权重路径、GPU 和启用状态，保存后写回后台使用的 YAML。PaddleOCR-VL 必须启用，OXR、OvisOCR3 和 Jev 可独立关闭。权重路径可以是绝对路径，也可以相对于 `deployment.model_root`，GPU 留空则继承部署默认值。关闭 Jev 后批次仍会筛选难例并生成复核结果。
 
-例如将 `deployment.models.ovis` 设为 `{enabled: true, path: OvisOCR3, port: 8102, context: 16384, gpu: "1", gpu_memory: 0.75, max_sequences: 4}`，Ovis 就会部署到 GPU 1。跨卡模型可同时设置 `gpu: "2,3"` 和 `tensor_parallel: 2`。在页面保存时，受变更影响的服务会卸载，常驻模式下可用 CLI 重新启动。直接编辑 YAML 后，可选中对应卡片按 **T** 重读配置，启用的模型会重启。
+例如将 `deployment.models.ovis` 设为 `{enabled: true, path: OvisOCR3, port: 8102, context: 16384, gpu: "1", gpu_memory: 0.75, max_sequences: 4}`，Ovis 就会部署到 GPU 1。跨卡模型可同时设置 `gpu: "2,3"` 和 `tensor_parallel: 2`。在页面保存时，受变更影响的服务会卸载，常驻模式会按新配置启动。切换到串行按需模式会卸载常驻模型。直接编辑 YAML 后，可选中对应卡片按 **T** 重读该模型的配置，启用的模型会重启。
 
 ## 后台数据怎么产生
 

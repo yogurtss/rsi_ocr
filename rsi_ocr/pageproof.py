@@ -81,7 +81,7 @@ def dashboard(snapshot, enqueue, closing=lambda: False):
 def main(argv=None):
     cli = argparse.ArgumentParser(prog="glyphstack", description="GlyphStack · Model control and document review")
     sub = cli.add_subparsers(dest="command", required=True)
-    server = sub.add_parser("console", help="启动模型后台与动态终端面板")
+    server = sub.add_parser("console", help="启动模型后台与动态终端面板，常驻模式自动并行加载")
     server.add_argument("--config", type=Path, default=DEFAULT_SETTINGS)
     server.add_argument("--port", type=int)
     server.add_argument("--headless", action="store_true", help="关闭交互面板，适用于服务进程")

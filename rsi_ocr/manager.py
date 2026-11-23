@@ -92,6 +92,8 @@ class Manager:
         self.journal_path = str(Path(self.journal_dir.name) / "traffic.sqlite")
         open_journal(self.journal_path)
         self.config["request_journal"] = self.journal_path
+        if self.mode == "managed":
+            self.enqueue("start", "all")
         self.worker.start()
         self.monitor.start()
 
@@ -130,7 +132,7 @@ class Manager:
             if self.closing.is_set():
                 raise ValueError("后台正在关闭")
             if action == "start" and value == "all" and self.mode != "managed":
-                raise ValueError("start all 需要 CLI 常驻模式")
+                raise ValueError("start all 需要后台并行常驻模式")
             if action == "start" and value != "all" and not self.models[value]["enabled"]:
                 raise ValueError(f"{value} 已在模型设置中关闭")
             self.jobs[job["id"]] = job
@@ -147,12 +149,12 @@ class Manager:
         with self.lock:
             if self.mode == mode:
                 return
-            self.validate_settings_change(mode)
+            self.validate_settings_change()
             if self.config_path:
                 yaml, config = self.read_settings()
                 config.setdefault("deployment", {})["mode"] = mode
                 self.write_settings(yaml, config)
-            self.mode = mode
+            self.apply_mode(mode)
 
     def read_settings(self):
         from ruamel.yaml import YAML
@@ -166,16 +168,26 @@ class Manager:
             yaml.dump(settings, tmp)
             tmp.chmod(self.config_path.stat().st_mode)
 
-    def validate_settings_change(self, mode, unloading=()):
+    def validate_settings_change(self):
+        if self.closing.is_set():
+            raise ValueError("后台正在关闭")
         if any(j["status"] in {"queued", "running"} for j in self.jobs.values()):
             raise ValueError("请等待当前任务和排队操作完成后保存模型设置")
-        if mode == "on_demand" and len(self.sessions.keys() - set(unloading)) > 1:
-            raise ValueError("请先用 CLI 停止多余模型，仅保留一个模型后切换")
+
+    def apply_mode(self, mode):
+        previous = self.mode
+        self.mode = mode
+        if self.worker.is_alive():
+            if mode == "managed":
+                self.enqueue("start", "all")
+            elif previous == "managed":
+                self.enqueue("stop", "all")
 
     def set_deployment(self, mode, changes):
         with self.lock:
             if not self.config_path:
                 raise ValueError("后台缺少 YAML 配置路径")
+            self.validate_settings_change()
             if changes.keys() - self.models.keys():
                 raise ValueError("未知模型")
             yaml, settings = self.read_settings()
@@ -194,7 +206,6 @@ class Manager:
             changed = [alias for alias in self.aliases if config["models"][alias] != self.config["models"][alias]]
             if config["capture"] != self.config["capture"] and "paddle" not in changed:
                 changed.append("paddle")
-            self.validate_settings_change(mode, changed)
             self.write_settings(yaml, settings)
             for alias in changed:
                 self.unload(alias)
@@ -203,7 +214,7 @@ class Manager:
                 self.models[alias].update(self.card(spec), detail="")
             self.config["capture"] = config["capture"]
             apply_model_selection(self.config, self.policy)
-            self.mode = mode
+            self.apply_mode(mode)
 
     def unload(self, alias):
         with self.lock:
@@ -260,7 +271,7 @@ class Manager:
         if self.mode == "managed":
             missing = [alias for alias in mining_models(self.config["mining"]) if not self.is_ready(alias)]
             if missing:
-                raise ValueError("CLI 常驻模式需要先启动这些模型：" + ", ".join(missing))
+                raise ValueError("模型未就绪，详情见工作台或 glyphstack status：" + ", ".join(missing))
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         output = self.root / stamp
         output.mkdir(parents=True)
@@ -303,6 +314,25 @@ class Manager:
         finally:
             self.unload_all()
 
+    def start_models(self, aliases, directory, job):
+        aliases = [alias for alias in aliases if self.models[alias]["enabled"]]
+        if self.mode == "managed" and len(aliases) > 1:
+            self.update(job, stage="并行加载模型")
+            failures = []
+            with ThreadPoolExecutor(max_workers=len(aliases)) as pool:
+                starts = {alias: pool.submit(self.load, alias, directory) for alias in aliases}
+                for alias, future in starts.items():
+                    try:
+                        future.result()
+                    except Exception as error:
+                        failures.append(f"{alias}：{error}")
+            if failures:
+                raise RuntimeError("；".join(failures))
+            return
+        for alias in aliases:
+            self.update(job, stage=f"加载 {alias}")
+            self.load(alias, directory)
+
     def work(self):
         try:
             while (job := self.queue.get()) is not None:
@@ -321,12 +351,9 @@ class Manager:
                             if job["value"] == "all":
                                 aliases = list(self.sessions)
                             self.prepare_restart(aliases)
-                        for alias in aliases:
-                            if not self.models[alias]["enabled"]:
-                                continue
-                            self.update(job, stage=f"加载 {alias}")
-                            self.load(alias, directory)
+                        self.start_models(aliases, directory, job)
                     elif job["value"] == "all":
+                        self.update(job, stage="卸载全部模型")
                         self.unload_all()
                     else:
                         self.unload(job["value"])

@@ -1162,11 +1162,16 @@ async function refreshRuntime() {
   panel.hidden = false;
   const jobs = status.jobs || [], models = Object.entries(status.models || {});
   const labels = {disabled:"已关闭", offline:"离线", starting:"加载中", healthy:"健康", unhealthy:"探测失败", failed:"启动失败", stopping:"释放中"};
+  const mode = {on_demand:"串行按需", managed:"并行常驻"}[status.mode] || "模型后台";
+  const ready = models.filter(([,model]) => model.status === "healthy").length;
+  const enabled = models.filter(([,model]) => model.enabled !== false).length;
   q("#runtime-summary").textContent = status.connected
-    ? `模型后台 · ${jobs.length ? jobs.length + " 项任务" : "空闲"}` : "模型后台 · 未连接";
+    ? `模型后台 · ${mode} · 就绪 ${ready}/${enabled}` : "模型后台 · 未连接";
   q("#runtime-detail").innerHTML = models.map(([alias,model]) =>
-    `<span><b>${esc(nameOf(alias))}</b> ${esc(labels[model.status] || model.status)}</span>`).join("")
-    + jobs.map(job => `<span>${esc(job.value)} · ${esc(job.stage)}</span>`).join("");
+    `<span><b>${esc(model.display_name || nameOf(alias))}</b> ${esc(labels[model.status] || model.status)}
+      ${model.enabled === false ? "" : ` · GPU ${esc(model.gpu)}`}
+      ${model.status === "failed" && model.detail ? `<small>${esc(model.detail)}</small>` : ""}</span>`).join("")
+    + jobs.map(job => `<span>${esc(job.value === "all" ? "全部模型" : job.value)} · ${esc(job.stage)}</span>`).join("");
   setTimeout(refreshRuntime,4000);
 }
 refreshRuntime();

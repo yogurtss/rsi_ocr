@@ -76,10 +76,10 @@
     <header class="settings-heading"><div><h2>识别流程与阈值</h2><p>沿着同一块裁图，查看模型如何识别、评分和筛选难例。</p></div>
       <span id="settings-batch"></span></header>
     <section class="deployment-settings panel">
-      <div><h3>模型部署</h3><p>按需模式逐个加载已启用的模型。CLI 常驻模式复用手动启动的服务。</p></div>
+      <div><h3>模型部署</h3><p>串行按需模式一次加载一个模型，批次结束后释放。后台并行常驻模式同时启动已启用的模型，供命令行重复调用。</p></div>
       <form id="deployment-form">
         <fieldset id="deployment-fields" disabled>
-          <label>运行方式 <select id="deployment-mode"><option value="on_demand">按需加载</option><option value="managed">CLI 多模型常驻</option></select></label>
+          <label>运行方式 <select id="deployment-mode"><option value="on_demand">串行按需</option><option value="managed">后台并行常驻</option></select></label>
           <div id="deployment-models"></div>
           <button id="save-deployment" disabled>保存模型设置</button>
         </fieldset>

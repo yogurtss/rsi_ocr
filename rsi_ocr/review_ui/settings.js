@@ -225,8 +225,8 @@ q("#deployment-form").onsubmit = async event => {
     savedDeployment = current;
     loadingDeployment = false;
     await loadDeployment(current.mode === "managed"
-      ? "已保存到 YAML。变更过的服务已卸载，可通过 CLI 启动。"
-      : "已保存到 YAML。下次运行将按新设置加载模型。");
+      ? "已保存到 YAML。后台将并行加载已启用的模型，进度见「模型后台」。"
+      : "已保存到 YAML。后续批次将逐个加载模型。");
   } catch (error) {
     status.textContent = error.message;
     fields.disabled = false;

@@ -28,7 +28,7 @@ mining:
 manager_port: 8520
 input_path: data/inbox
 deployment:
-  mode: on_demand               # on_demand 按需轮换；managed 由 CLI 启停，多模型可同时常驻
+  mode: on_demand               # on_demand 逐个加载、串行推理；managed 后台并行启动并常驻
   model_root: /mnt/g/models    # Windows 的 G:\models；也可指向 runs/model-cache
   minicpm_repo: runs/MiniCPM-OCR  # Jev 官方渲染服务的源码目录
   gpu: "0"                     # 模型省略 gpu 时使用此设备

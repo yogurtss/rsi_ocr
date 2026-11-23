@@ -372,6 +372,7 @@ dialog::backdrop { background: #101b34bb; }
 }
 #runtime-detail { min-width:210px; max-width:min(350px,85vw); }
 #runtime-detail span { display:block; padding:6px 10px; color:var(--ink); overflow-wrap:anywhere; font-size:.86rem; }
+#runtime-detail small { display:block; margin-top:4px; color:var(--warm); }
 
 .deployment-settings { display:grid; gap:10px; padding:18px; margin-bottom:14px; }
 .deployment-settings p,.rules-heading + p { color:var(--muted); font-size:.88rem; }
