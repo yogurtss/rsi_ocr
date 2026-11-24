@@ -1,5 +1,5 @@
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import islice
 from pathlib import Path
 
@@ -268,12 +268,21 @@ def warm(config, manifest, output, alias, check_cancelled=None, resume=None, rep
             if row["task"] in service.config["tasks"] and not (alias == policy["target"] and "target" in row):
                 yield row
 
-    rows = work_items()
     workers = max(policy["workers"], service.config.get("max_sequences", 0))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         counts = Counter()
-        while batch := list(islice(rows, workers * 4)):
-            counts.update(pool.map(read, batch))
+        pending = set()
+        try:
+            for row in work_items():
+                # Keep one worker-pool's worth of regions ready while slower requests finish.
+                if len(pending) >= 2 * workers:
+                    completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    counts.update(future.result() for future in completed)
+                pending.add(pool.submit(read, row))
+            counts.update(future.result() for future in pending)
+        finally:
+            for future in pending:
+                future.cancel()
     return dict(counts)
 
 
