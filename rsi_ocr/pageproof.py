@@ -50,6 +50,7 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
     last_refresh = 0.0
     console = Console()
     expanded = False
+    performance = False
     progress_page = None
     show_model_log = model_logs is not None and console.width >= 100
     log_source = "auto"
@@ -62,7 +63,7 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
             while not closing():
                 if time.monotonic() - last_refresh >= 0.8:
                     snap = snapshot()
-                    if show_model_log:
+                    if show_model_log and not performance:
                         try:
                             model_log = model_logs(log_source)
                         except (ValueError, OSError) as error:
@@ -75,7 +76,7 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
                     message = f"{selected} 并发 {limit} → {concurrency_input or '_'}   Enter 提交 · Esc 取消"
                 live.update(console_view(snap, selected, message, expanded, console.width, console.height,
                                          time.time(), frame, model_log=model_log if show_model_log else None,
-                                         progress_page=progress_page, log_source=log_source), refresh=True)
+                                         progress_page=progress_page, log_source=log_source, performance=performance), refresh=True)
                 if select.select([fd], [], [], 0.18)[0]:
                     key = os.read(fd, 1).decode(errors="ignore").lower()
                     if key == "\x1b" and select.select([fd], [], [], 0.02)[0]:
@@ -95,6 +96,11 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
                             concurrency_input = concurrency_input[:-1]
                         elif key.isascii() and key.isdigit():
                             concurrency_input += key
+                    elif key == "f":
+                        performance = not performance
+                    elif performance:
+                        if key == "\x1b":
+                            performance = False
                     elif key == "g":
                         progress_page = 0 if progress_page is None else None
                     elif progress_page is not None:

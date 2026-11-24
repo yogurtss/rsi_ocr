@@ -253,7 +253,7 @@ def paddlex_version():
 
 
 @contextmanager
-def layout_checkpoint(detector, shard, report):
+def layout_checkpoint(detector, shard, report, activity=None):
     """Save single-page PaddleX layout boxes before the downstream VLM call."""
     process = getattr(detector, "process", None)
     if process is None:
@@ -261,10 +261,19 @@ def layout_checkpoint(detector, shard, report):
         return
     path = shard.parent.parent / "layout_cache" / (shard.stem + ".json")
 
+    def run_detector(batch, *args, **kwargs):
+        if activity:
+            activity(1)
+        try:
+            return process(batch, *args, **kwargs)
+        finally:
+            if activity:
+                activity(0)
+
     def checkpointed(batch, *args, **kwargs):
         # The single-image pipeline supplies the original BGR array here.
         if len(batch.instances) != 1 or not hasattr(batch.instances[0], "shape"):
-            return process(batch, *args, **kwargs)
+            return run_detector(batch, *args, **kwargs)
         if path.is_file():
             saved = json.loads(path.read_bytes())
             if saved["paddlex"] == paddlex_version():
@@ -272,7 +281,7 @@ def layout_checkpoint(detector, shard, report):
                 return {"boxes": saved["boxes"], "input_img": batch.instances,
                         "input_path": batch.input_paths, "page_index": batch.page_indexes}
         start = monotonic()
-        result = process(batch, *args, **kwargs)
+        result = run_detector(batch, *args, **kwargs)
         seconds = monotonic() - start
         if set(result) == {"boxes", "input_img", "input_path", "page_index"}:
             with atomic_output(path) as temporary:
@@ -466,6 +475,8 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
         nonlocal done, reused
         with state_lock:
             current = f"{entry.page['doc_id']} · 第 {entry.page['page_id']} 页"
+            if "layout_running" in values:
+                active["layout_running"] = values.pop("layout_running")
             if phase == "复用整页":
                 reused += 1
             elif phase == "准备版面":
@@ -490,7 +501,10 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                 label = "复用本页版面断点" if cached else f"版面断点已保存 · 检测 {seconds:.2f} 秒"
                 progress(f"{label} · {entry.page['doc_id']} 第 {entry.page['page_id']} 页")
 
-        return layout_checkpoint(detector, entry.shard, layout_ready)
+        def activity(running):
+            update(entry, "版面检测" if running else "版面检测结束", layout_running=running)
+
+        return layout_checkpoint(detector, entry.shard, layout_ready, activity if report_page else None)
 
     def recognize(client, entry, source, detector, prepared, times, started, scratch):
         pipeline, inner, recorder = client

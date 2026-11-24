@@ -26,6 +26,7 @@ from .local import (
 )
 from .store import atomic_output
 from .progress import BatchProgress, STAGE_NAMES, overall
+from .performance import PerformanceRecord
 
 
 class Manager:
@@ -41,6 +42,7 @@ class Manager:
         self.config = local_config(settings, base)
         self.layout_runtime = {"status": "idle", "device": None}
         self.capture_progress = {}
+        self.performance = None
         self.batch_progress = None
         self.progress_log_times = {}
         self.base = base
@@ -211,6 +213,7 @@ class Manager:
                     "layout": self.config["layout"].copy(), "layout_device": self.config["layout"]["device"],
                     "layout_runtime": self.layout_runtime.copy(),
                     "capture_progress": self.capture_progress.copy(),
+                    "performance": self.performance.snapshot() if self.performance else None,
                     "batch_progress": self.batch_progress.snapshot() if self.batch_progress else None,
                     "capture_queues": self.config["capture"].get("predict", {}).get("use_queues",
                                       self.config["capture"].get("pipeline", {}).get("use_queues", True)),
@@ -473,6 +476,8 @@ class Manager:
         while not self.closing.wait(2):
             with self.lock:
                 sessions = list(self.sessions.items())
+                record = self.performance
+                values = {name: 0 for name, model in self.models.items() if model["status"] == "offline"}
             for alias, session in sessions:
                 if self.closing.is_set():
                     return
@@ -482,6 +487,35 @@ class Manager:
                 with self.lock:
                     if self.sessions.get(alias) is session:
                         self.models[alias].update(status="healthy" if ok else "unhealthy", load=load)
+                        values[alias] = load.get("running")
+            with self.lock:
+                if record is self.performance and record and record.recording:
+                    values["layout"] = (self.capture_progress.get("layout_running")
+                                        if self.layout_runtime.get("status") == "running" else 0)
+                    record.sample(values)
+
+    @contextmanager
+    def record_performance(self, job, output):
+        with self.lock:
+            record = PerformanceRecord(self.models)
+            self.performance = record
+            record.sample({name: 0 for name, model in self.models.items() if model["status"] == "offline"})
+        try:
+            yield
+        finally:
+            with self.lock:
+                record.recording = False
+                record.sample({name: 0 for name, model in self.models.items() if model["status"] == "offline"})
+            path = output / f"concurrency-{job.get('id') or uuid4().hex}.png"
+            try:
+                record.save(path)
+            except Exception as error:
+                self.log(f"性能图保存失败 · {error}", error=True)
+            else:
+                with self.lock:
+                    record.image = str(path)
+                    self.update_job(job, performance_image=str(path))
+                self.log(f"并发曲线已保存 · {path}")
 
     def infer(self, job):
         with self.lock:
@@ -499,9 +533,10 @@ class Manager:
         with resume_batch(self.root, source, self.settings, self.check_closing) as (output, resumed, signatures):
             self.log(f"{'续跑' if resumed else '新建'}批次 · {output}")
             self.update_job(job, output=str(output), stage="导入页面")
-            pages = render_pages(source, output / "input", self.settings, progress=self.report_progress,
-                                 reuse_existing=resumed, signatures=signatures, streaming=True, check_cancelled=self.check_closing)
-            self.infer_pages(job, output, pages)
+            with self.record_performance(job, output):
+                pages = render_pages(source, output / "input", self.settings, progress=self.report_progress,
+                                     reuse_existing=resumed, signatures=signatures, streaming=True, check_cancelled=self.check_closing)
+                self.infer_pages(job, output, pages)
 
     def infer_pages(self, job, output, pages):
         config = deepcopy(self.config)

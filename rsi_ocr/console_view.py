@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .pageproof import LABELS
+from .performance import terminal_line
 from .progress import STAGE_NAMES, fraction, overall
 
 
@@ -252,8 +253,31 @@ def model_log_panel(source, streams, rows):
                  box=box.ROUNDED, height=rows + 2)
 
 
+def performance_view(record, width, height):
+    lines = [Text("实时并发  ·  引擎请求 / 版面检测调用    F / Esc 返回", style="bold cyan")]
+    if not record or not record["samples"]:
+        lines.append(Text("等待批次开始", style="dim"))
+        return Group(*lines)
+    samples = record["samples"]
+    limits = record["limits"]
+    lines.append(Text(f"批次时间 {samples[0][0]:.0f}–{samples[-1][0]:.0f} 秒  ·  "
+                      + ("记录中" if record["recording"] else "已结束"), style="dim"))
+    rows = min(5, max(1, (height - 4) // max(1, len(limits)) - 1))
+    for name, limit in limits.items():
+        label, _, color = MODELS.get(name, ("版面检测", "", "bright_green"))
+        current = samples[-1][1].get(name)
+        lines.append(Text(f"{label}   {current if current is not None else '—'} / {limit}", style=color))
+        lines.extend(Text(line, style=color, no_wrap=True) for line in
+                     terminal_line(samples, name, limit, max(1, min(160, width - 2)), rows))
+    if record.get("image"):
+        lines.append(Text(record["image"], style="dim"))
+    return Group(*lines)
+
+
 def console_view(snap, selected, message, expanded, width, height, now, frame, model_log=None, progress_page=None,
-                 log_source="auto"):
+                 log_source="auto", performance=False):
+    if performance:
+        return performance_view(snap.get("performance"), width, height)
     batch = snap.get("batch_progress")
     if progress_page is not None:
         return progress_view(batch, progress_page, height, width)
@@ -286,7 +310,7 @@ def console_view(snap, selected, message, expanded, width, height, now, frame, m
     header.append(f"   {snap['mode']}   127.0.0.1:{snap['port']}", style="bold")
     header.append(f"   {len(active)} 项任务", style="cyan")
     controls = Text(no_wrap=True, overflow="ellipsis")
-    for key, action in (("G", "进度"), ("1–4", "选卡"), ("0", "日志自动"), ("C", "并发"), ("S", "启动"), ("X", "停止"), ("A", "全停"), ("T", "↻ 重启"),
+    for key, action in (("G", "进度"), ("F", "性能"), ("1–4", "选卡"), ("0", "日志自动"), ("C", "并发"), ("S", "启动"), ("X", "停止"), ("A", "全停"), ("T", "↻ 重启"),
                         ("R", "运行"), ("L", "vLLM"), ("P", "POST"), ("^C", "退出")):
         controls.append(f" {key} ", style="bold black on bright_cyan" if key == "T" else "bold cyan")
         controls.append(action + " ")
