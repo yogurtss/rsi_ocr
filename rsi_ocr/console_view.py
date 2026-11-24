@@ -66,6 +66,21 @@ def model_card(alias, index, spec, selected, requests, frame, now, spacious):
                  padding=(0, 1))
 
 
+def layout_card(layout, height):
+    device, _, index = layout["device"].partition(":")
+    hardware = Text(f"GPU {index}" if device == "gpu" else "CPU", style="bright_green",
+                    no_wrap=True, overflow="ellipsis")
+    weights = Text(layout["path"], style="dim", no_wrap=True, overflow="ellipsis")
+    if height == 3:
+        hardware.append("  ·  ")
+        hardware.append_text(weights)
+        content = hardware
+    else:
+        content = Group(hardware, weights)
+    return Panel(content, title="版面检测", title_align="left", border_style="grey50", box=box.ROUNDED,
+                 padding=(0, 1), height=height)
+
+
 def traffic_panel(requests, limit, now, frame):
     table = Table.grid(expand=True, padding=(0, 1))
     table.add_column(width=8)
@@ -111,13 +126,18 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
     logs = snap.get("logs", [])
     if height <= 5:
         return log_panel(logs, max(1, height - 2))
-    columns = 4 if width >= 100 else 2
+    layout = snap.get("layout")
+    layout_in_grid = bool(layout and width >= 125)
+    columns = 5 if layout_in_grid else 4 if width >= 100 else 2
     spacious = height >= 30
+    card_height = 5 + int(spacious)
     grid = Table.grid(expand=True, padding=(0, 1))
     for _ in range(columns):
         grid.add_column(ratio=1)
     cards = [model_card(alias, i, spec, alias == selected, requests, frame, now, spacious)
              for i, (alias, spec) in enumerate(snap["models"].items(), 1)]
+    if layout_in_grid:
+        cards.append(layout_card(layout, card_height))
     for i in range(0, len(cards), columns):
         grid.add_row(*cards[i:i + columns])
     active = [j for j in snap["jobs"] if j["status"] in {"running", "queued"}]
@@ -145,10 +165,13 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
         jobs.add_row("空闲", "", Text(snap["input_path"]), "")
     visible = [header]
     remaining = height - 3  # Header, controls and footer.
-    card_height = ((len(cards) + columns - 1) // columns) * (5 + int(spacious))
-    if not expanded and remaining >= card_height + 3:
+    grid_height = ((len(cards) + columns - 1) // columns) * card_height
+    if not expanded and remaining >= grid_height + 3:
         visible.append(grid)
-        remaining -= card_height
+        remaining -= grid_height
+        if layout and not layout_in_grid and remaining >= 6:
+            visible.append(layout_card(layout, 3))
+            remaining -= 3
     visible.append(controls)
     job_height = max(1, len(recent_jobs)) + 2
     if not expanded:
