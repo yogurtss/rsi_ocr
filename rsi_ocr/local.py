@@ -202,9 +202,17 @@ def set_concurrency(spec, sequences):
 
 def configure_models(config, root, minicpm=None, deployment=None):
     deployment = deployment or {}
-    layout_device = deployment.get("layout_device", "cpu")
+    model_options = deployment.get("models", {})
+    layout = model_options.get("layout", {})
+    if not isinstance(layout, dict):
+        raise ValueError("deployment.models.layout 需为模型设置")
+    layout_path = layout.get("path", deployment.get("layout_path", "PP-DocLayoutV3"))
+    if not isinstance(layout_path, str) or not layout_path.strip():
+        raise ValueError("deployment.models.layout.path 不能为空")
+    layout_device = layout.get("device", deployment.get("layout_device", "cpu"))
     if not isinstance(layout_device, str) or not re.fullmatch(r"cpu|gpu:[0-9]+", layout_device):
-        raise ValueError("deployment.layout_device 需为 cpu 或 gpu:<编号>，例如 gpu:0")
+        raise ValueError("deployment.models.layout.device 需为 cpu 或 gpu:<编号>，例如 gpu:0")
+    config["layout"] = {"path": layout_path.strip(), "device": layout_device}
     models = config["models"]
     models["paddle"]["revision"] = "PaddleOCR-VL-1.6-local"
     models["oxr"]["revision"] = "OXR-1.0-c708407f"
@@ -216,7 +224,7 @@ def configure_models(config, root, minicpm=None, deployment=None):
         ("ovis", "OvisOCR3", 16384), ("jev", "MiniCPM-OCR-Jev", 16384),
     ]:
         launch = models[alias]["launch"]
-        options = deployment.get("models", {}).get(alias, {})
+        options = model_options.get(alias, {})
         enabled = options.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ValueError(f"{alias}.enabled 需为 true 或 false")
@@ -278,7 +286,7 @@ def configure_models(config, root, minicpm=None, deployment=None):
 
     jev_dir = jev_runtime_dir(minicpm)
     sidecar = models["jev"]["sidecars"]["render"]
-    render_port = deployment.get("models", {}).get("jev", {}).get("render_port", 18500)
+    render_port = model_options.get("jev", {}).get("render_port", 18500)
     sidecar["argv"][-2:] = [str(render_port), models["jev"]["engine_url"]]
     models["jev"]["base_url"] = f"http://127.0.0.1:{render_port}"
     sidecar["cwd"] = str(jev_dir)
@@ -292,7 +300,7 @@ def configure_models(config, root, minicpm=None, deployment=None):
         )
     config["capture"]["pipeline"].update(
         pipeline_version="v1.6", device=layout_device,
-        layout_detection_model_dir=str(root / deployment.get("layout_path", "PP-DocLayoutV3")),
+        layout_detection_model_dir=str(root / Path(config["layout"]["path"]).expanduser()),
     )
     config["mining"]["workers"] = 4
     config["mining"]["splits"].append("benchmark")

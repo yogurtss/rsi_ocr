@@ -253,8 +253,10 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
             status = endpoint(manager_port, "/status")
         except ValueError:
             return {"connected": False}
+        layout_device = status.get("layout_device", "cpu")
         return {"connected": True, "mode": status.get("mode"), "models": status["models"],
-                "layout_device": status.get("layout_device", "cpu"),
+                "layout": status.get("layout") or {"path": "PP-DocLayoutV3", "device": layout_device},
+                "layout_device": layout_device,
                 "jobs": [job for job in status["jobs"] if job["status"] in {"running", "queued"}]}
 
     @app.put("/api/runtime/deployment/{mode}")

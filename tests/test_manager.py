@@ -1,3 +1,4 @@
+import json
 import time
 import unittest
 from contextlib import contextmanager
@@ -338,30 +339,40 @@ class ManagerTests(unittest.TestCase):
             self.assertTrue(manager.models["paddle"]["enabled"])
             manager.unload_all()
 
-    def test_layout_device_can_be_saved_without_changing_model_devices(self):
-        from rsi_ocr.manager import Manager
+    def test_layout_model_settings_migrate_legacy_keys_and_preserve_model_devices(self):
+        from rsi_ocr.manager import DeploymentSettings, LayoutSettings, Manager
 
         with TemporaryDirectory() as directory:
             path = Path(directory) / "settings.yaml"
-            path.write_text(Path("configs/import.yaml").read_text())
             base = Path("configs/default.yaml")
-            settings = load_config(path)
-            settings["deployment"].pop("layout_device")
+            settings = load_config("configs/import.yaml")
+            settings["deployment"]["models"].pop("layout")
+            settings["deployment"].update(layout_path="old-layout", layout_device="gpu:1")
+            path.write_text(json.dumps(settings))
             manager = Manager(settings, base, 8520, path)
-            self.assertEqual(manager.snapshot()["layout_device"], "cpu")
+            self.assertEqual(manager.snapshot()["layout"], {"path": "old-layout", "device": "gpu:1"})
 
-            manager.set_deployment("on_demand", {}, layout_device="gpu:2")
+            change = DeploymentSettings(
+                mode="on_demand", models={"layout": {"path": "new-layout", "device": "gpu:2"}}
+            )
+            manager.set_deployment(change.mode, change.models)
             manager.set_deployment("on_demand", {})
-            reloaded = Manager(load_config(path), base, 8520, path)
-            self.assertEqual(manager.snapshot()["layout_device"], "gpu:2")
-            self.assertEqual(reloaded.config["capture"]["pipeline"]["device"], "gpu:2")
+            saved = load_config(path)
+            self.assertNotIn("layout_path", saved["deployment"])
+            self.assertNotIn("layout_device", saved["deployment"])
+            self.assertEqual(saved["deployment"]["models"]["layout"], {"path": "new-layout", "device": "gpu:2"})
+            reloaded = Manager(saved, base, 8520, path)
+            self.assertEqual(reloaded.snapshot()["layout"], manager.snapshot()["layout"])
+            pipeline = reloaded.config["capture"]["pipeline"]
+            self.assertEqual(pipeline["device"], "gpu:2")
+            self.assertEqual(Path(pipeline["layout_detection_model_dir"]).name, "new-layout")
             self.assertEqual(reloaded.models["paddle"]["gpu"], "0")
 
-            with self.assertRaisesRegex(ValueError, "deployment.layout_device"):
-                manager.set_deployment("on_demand", {}, layout_device="gpu:-1")
-            self.assertEqual(load_config(path)["deployment"]["layout_device"], "gpu:2")
+            with self.assertRaisesRegex(ValueError, r"deployment\.models\.layout\.device"):
+                manager.set_deployment("on_demand", {"layout": LayoutSettings(path="new-layout", device="gpu:-1")})
+            self.assertEqual(load_config(path), saved)
             manager.set_deployment("on_demand", {}, layout_device="cpu")
-            self.assertEqual(manager.snapshot()["layout_device"], "cpu")
+            self.assertEqual(manager.snapshot()["layout"], {"path": "new-layout", "device": "cpu"})
 
     def test_managed_inference_with_only_paddle(self):
         from rsi_ocr.manager import Manager

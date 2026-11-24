@@ -93,6 +93,7 @@ class Manager:
                 self.models[alias].update(self.card(spec), detail="")
             if "paddle" in replacements:
                 self.config["capture"] = config["capture"]
+                self.config["layout"] = config["layout"]
             apply_model_selection(self.config, self.policy)
 
     def start(self):
@@ -138,7 +139,7 @@ class Manager:
             return {"requests": requests, "logs": [entry.copy() for entry in self.logs],
                     "config_path": str(self.config_path or ""),
                     "service": "pageproof", "mode": self.mode, "port": self.port, "studio_port": self.settings["port"],
-                    "layout_device": self.config["capture"]["pipeline"]["device"],
+                    "layout": self.config["layout"].copy(), "layout_device": self.config["layout"]["device"],
                     "output_root": str(self.root), "input_path": str(self.default_input),
                     "models": {k: v.copy() for k, v in self.models.items()},
                     "jobs": [v.copy() for v in finished[-25:] + active]}
@@ -257,15 +258,25 @@ class Manager:
             if not self.config_path:
                 raise ValueError("后台缺少 YAML 配置路径")
             self.validate_settings_change()
-            if changes.keys() - self.models.keys():
+            if changes.keys() - self.models.keys() - {"layout"}:
                 raise ValueError("未知模型")
             yaml, settings = self.read_settings()
             deployment = settings.setdefault("deployment", {})
             deployment["mode"] = mode
-            if layout_device is not None:
-                deployment["layout_device"] = layout_device
             options = deployment.setdefault("models", {})
+            if layout_device is not None and "layout" not in changes:
+                options.setdefault("layout", {})["device"] = layout_device
+                deployment.pop("layout_device", None)
             for alias, change in changes.items():
+                if alias == "layout":
+                    if not isinstance(change, LayoutSettings):
+                        raise ValueError("版面检测设置需要权重路径和设备")
+                    options.setdefault("layout", {}).update(path=change.path.strip(), device=change.device)
+                    deployment.pop("layout_path", None)
+                    deployment.pop("layout_device", None)
+                    continue
+                if not isinstance(change, ModelSettings):
+                    raise ValueError(f"{alias} 设置需要启用状态、权重路径和 GPU")
                 model = options.setdefault(alias, {})
                 model.update(enabled=change.enabled, path=change.path.strip())
                 if gpu := change.gpu.strip():
@@ -284,6 +295,7 @@ class Manager:
                 self.config["models"][alias] = spec
                 self.models[alias].update(self.card(spec), detail="")
             self.config["capture"] = config["capture"]
+            self.config["layout"] = config["layout"]
             apply_model_selection(self.config, self.policy)
             self.apply_mode(mode)
 
@@ -475,9 +487,14 @@ class ModelSettings(BaseModel):
     gpu: str
 
 
+class LayoutSettings(BaseModel):
+    path: str
+    device: str
+
+
 class DeploymentSettings(BaseModel):
     mode: Literal["on_demand", "managed"]
-    models: dict[str, ModelSettings]
+    models: dict[str, ModelSettings | LayoutSettings]
     layout_device: str | None = None
 
 

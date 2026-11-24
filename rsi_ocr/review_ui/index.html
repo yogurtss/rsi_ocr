@@ -79,11 +79,7 @@
       <div><h3>模型部署</h3><p>串行按需模式一次加载一个模型，批次结束后释放。后台并行常驻模式同时启动已启用的模型，供命令行重复调用。</p></div>
       <form id="deployment-form">
         <fieldset id="deployment-fields" disabled>
-          <div class="deployment-options">
-            <label>运行方式 <select id="deployment-mode"><option value="on_demand">串行按需</option><option value="managed">后台并行常驻</option></select></label>
-            <label>版面检测设备 <select id="layout-device"><option value="cpu">CPU</option><option value="gpu">GPU</option></select></label>
-            <label id="layout-gpu-field" hidden>GPU 编号 <input id="layout-gpu" type="number" min="0" step="1" value="0" required disabled></label>
-          </div>
+          <label>运行方式 <select id="deployment-mode"><option value="on_demand">串行按需</option><option value="managed">后台并行常驻</option></select></label>
           <div id="deployment-models"></div>
           <button id="save-deployment" disabled>保存模型设置</button>
         </fieldset>

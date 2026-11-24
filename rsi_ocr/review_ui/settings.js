@@ -164,26 +164,45 @@ function showFlowReaders() {
 }
 
 function readDeployment() {
-  const models = Object.fromEntries([...document.querySelectorAll(".deployment-model")].map(row => [
-    row.dataset.model, {
+  const models = Object.fromEntries([...document.querySelectorAll(".deployment-model")].map(row => {
+    const alias = row.dataset.model;
+    const path = row.querySelector("[name=path]").value.trim();
+    if (alias === "layout") {
+      const device = q("#layout-device").value === "gpu" ? `gpu:${q("#layout-gpu").value}` : "cpu";
+      return [alias, {path, device}];
+    }
+    return [alias, {
       enabled: row.querySelector("[name=enabled]").checked,
-      path: row.querySelector("[name=path]").value.trim(),
+      path,
       gpu: row.querySelector("[name=gpu]").value.trim(),
-    },
-  ]));
-  const layout = q("#layout-device").value;
-  const layout_device = layout === "gpu" ? `gpu:${q("#layout-gpu").value}` : "cpu";
-  return {mode:q("#deployment-mode").value, layout_device, models};
+    }];
+  }));
+  return {mode:q("#deployment-mode").value, models};
 }
 
 function updateDeploymentButton() {
-  const useGpu = q("#layout-device").value === "gpu";
-  q("#layout-gpu-field").hidden = !useGpu;
-  q("#layout-gpu").disabled = !useGpu;
+  const layoutDevice = q("#layout-device");
+  const useGpu = layoutDevice?.value === "gpu";
+  if (layoutDevice) {
+    q("#layout-gpu-field").hidden = !useGpu;
+    q("#layout-gpu").disabled = !useGpu;
+  }
   const current = readDeployment();
   q("#save-deployment").disabled = !savedDeployment || !Object.values(current.models).every(model => model.path)
-    || (useGpu && !/^gpu:[0-9]+$/.test(current.layout_device))
+    || (useGpu && !/^gpu:[0-9]+$/.test(current.models.layout.device))
     || JSON.stringify(current) === JSON.stringify(savedDeployment);
+}
+
+function layoutDeploymentRow(layout) {
+  const [device, gpu = "0"] = layout.device.split(":");
+  return `<div class="deployment-model" data-model="layout">
+    <label><input type="checkbox" checked disabled aria-label="版面检测已启用"> <strong>版面检测</strong> <small>必开</small></label>
+    <label>权重路径<input type="text" name="path" value="${esc(layout.path)}" required></label>
+    <div class="layout-device-options">
+      <label>设备 <select id="layout-device"><option value="cpu">CPU</option><option value="gpu" ${device === "gpu" ? "selected" : ""}>GPU</option></select></label>
+      <label id="layout-gpu-field" ${device === "gpu" ? "" : "hidden"}>GPU 编号 <input id="layout-gpu" type="number" min="0" step="1" value="${esc(gpu)}" required></label>
+    </div>
+  </div>`;
 }
 
 async function loadDeployment(message) {
@@ -195,10 +214,7 @@ async function loadDeployment(message) {
     const runtime = await api("/api/runtime");
     if (!runtime.connected || !runtime.mode) throw new Error("通过 glyphstack studio 连接后台后可修改模型设置。");
     q("#deployment-mode").value = runtime.mode;
-    const [layout, gpu] = (runtime.layout_device || "cpu").split(":");
-    q("#layout-device").value = layout;
-    q("#layout-gpu").value = gpu ?? "0";
-    q("#deployment-models").innerHTML = Object.entries(runtime.models).map(([alias, model]) =>
+    q("#deployment-models").innerHTML = layoutDeploymentRow(runtime.layout) + Object.entries(runtime.models).map(([alias, model]) =>
       `<div class="deployment-model" data-model="${esc(alias)}">
         <label><input type="checkbox" name="enabled" ${model.enabled !== false ? "checked" : ""}
           ${alias === "paddle" ? "disabled" : ""}> <strong>${esc(model.display_name || nameOf(alias))}</strong>
@@ -230,7 +246,7 @@ q("#deployment-form").onsubmit = async event => {
   status.textContent = "正在保存模型设置…";
   try {
     await api("/api/runtime/deployment", {method:"PUT", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({mode:current.mode, layout_device:current.layout_device, models})});
+      body:JSON.stringify({mode:current.mode, models})});
     savedDeployment = current;
     loadingDeployment = false;
     await loadDeployment(current.mode === "managed"

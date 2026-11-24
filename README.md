@@ -136,15 +136,15 @@ glyphstack stop all --port 8520            # 命令行卸载全部模型
 | 参数 | 用途 |
 |---|---|
 | `manager_port`、`port` | 终端后台端口与前端端口，默认分别为 8520、8517。 |
-| `deployment` | 运行方式、权重根目录 `model_root`、可选的 Jev 外部源码目录 `minicpm_repo`、版面检测权重和设备 `layout_device`、默认 GPU 设置。 |
-| `deployment.models` | 各模型的启用状态 `enabled`、权重目录 `path`、GPU、服务端口和上下文长度，以及 Jev 渲染端口。 |
+| `deployment` | 运行方式、权重根目录 `model_root`、可选的 Jev 外部源码目录 `minicpm_repo`、默认 GPU 设置。 |
+| `deployment.models` | 各模型的启用状态、权重路径和部署参数。`layout` 配置版面检测的权重路径和设备。 |
 | `input_path`、`output_root` | 默认输入文件或目录、结果批次根目录。复核时保留批次内的图片和裁图。 |
 | `extensions`、`recursive`、`dpi` | 输入类型、递归开关、PDF 渲染分辨率。 |
 | `mining` | 难例触发阈值、排序权重、抽检比例和入队配额。 |
 
 在 **流程与设置 → 模型部署** 可分别修改权重路径、GPU 和启用状态，保存后写回后台使用的 YAML。PaddleOCR-VL 必须启用，OXR、OvisOCR3 和 Jev 可独立关闭。权重路径可以是绝对路径，也可以相对于 `deployment.model_root`，GPU 留空则继承部署默认值。关闭 Jev 后批次仍会筛选难例并生成复核结果。
 
-「版面检测设备」默认是 CPU。选择 GPU 后填写设备编号，例如 `0` 或 `1`，保存后用于后续批次。也可在 YAML 中设置 `deployment.layout_device: gpu:0`。编号从 0 开始，按 Console 环境可见的 GPU 顺序计算，可与 PaddleOCR-VL 识别服务的 GPU 分开指定。单卡部署时，GPU 版面检测和 PaddleOCR-VL 识别共用这张卡的显存。
+在「版面检测」模型行可以设置权重路径和设备，默认使用 `PP-DocLayoutV3` 和 CPU。选择 GPU 后填写设备编号，例如 `0` 或 `1`，保存后用于后续批次。YAML 中对应 `deployment.models.layout: {path: PP-DocLayoutV3, device: gpu:0}`。编号从 0 开始，按 Console 环境可见的 GPU 顺序计算，可与 PaddleOCR-VL 识别服务的 GPU 分开指定。单卡部署时，GPU 版面检测和 PaddleOCR-VL 识别共用这张卡的显存。
 
 GPU 版面检测需要在 Console 所用的 Python 环境中用 `paddlepaddle-gpu` 替换 CPU 版。以下命令以 CUDA 12.6 为例，安装后重启 Console。[PaddlePaddle GPU 安装说明](https://paddlepaddle.github.io/FastDeploy/get_started/installation/nvidia_gpu/)
 
