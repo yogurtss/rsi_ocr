@@ -12,7 +12,7 @@ const selectionReasons = {low_score: "最高分偏低", close_scores: "不同转
   no_valid_output: "没有有效转录", no_scored_output: "Jev 未返回可用分数",
   all_precheck_rejected: "全部候选被 Jev 预检拒绝", family_agreement: "多个模型家族转录一致",
   policy_tiebreak: "支持数并列，按配置顺序选择", sole_candidate: "仅有一份可选转录"};
-const statuses = {pending: "未复核", approved: "已通过", rejected: "已驳回", needs_check: "待核查"};
+const statuses = {pending: "未复核", approved: "已采用", rejected: "已排除", needs_check: "待核查"};
 const reasons = {
   low_target_judge: "Paddle 分数低", teacher_disagreement: "模型输出分歧",
   better_judged_candidate: "候选分数更高", numeric_conflict: "数字冲突",
@@ -108,7 +108,8 @@ function renderQueue() {
   list.innerHTML = state.rows.slice(start, start + queuePageSize).map(row => {
     const selected = state.current === row.case_id;
     const title = row.doc_id.split("/").pop();
-    const status = row.review_status !== "pending" ? statuses[row.review_status] :
+    const status = row.review_status === "approved" && row.review_model ? nameOf(row.review_model) + " · 已采用" :
+      row.review_status !== "pending" ? statuses[row.review_status] :
       row.selection_status === "selected" ? nameOf(row.automatic_model) + " · 自动选定" : row.selection_status === "needs_choice" ? "待人工选模" : "无有效转录";
     return `<button class="queue-item ${selected ? "selected" : ""}" data-case="${esc(row.case_id)}"
       aria-current="${selected}" title="${esc(row.doc_id)} · ${esc(row.region_id)}">
@@ -143,10 +144,16 @@ function filterQueue() {
   const gold = q("#gold").value;
   const filterCount = [state.level, state.task, status, reason, judge, gold].filter(value => value !== "all").length;
   q("#filter-count").textContent = filterCount ? " · " + filterCount : "";
-  state.rows = state.data.rows.filter(row => (
+  const scopeCounts = {auto_hard: 0, needs_choice: 0};
+  state.rows = state.data.rows.filter(row => {
+    const autoHard = row.hard_case && row.selection_status === "selected" && row.review_status === "pending";
+    const needsChoice = row.selection_status === "needs_choice" && row.review_status === "pending";
+    if (autoHard) scopeCounts.auto_hard++;
+    if (needsChoice) scopeCounts.needs_choice++;
+    return (
     (state.level === "all" || difficultyOf(row) === state.level) &&
     (scope === "all" || (scope === "queue" && row.queued) || (scope === "audit" && row.audit_sample)
-      || (scope === "needs_choice" && row.selection_status === "needs_choice" && row.review_status === "pending")
+      || (scope === "auto_hard" && autoHard) || (scope === "needs_choice" && needsChoice)
       || (scope === "selection_check" && row.selection_flagged)
       || (scope === "outside" && !row.queued))
     && (state.task === "all" || row.task === state.task)
@@ -156,12 +163,15 @@ function filterQueue() {
     && (gold === "all" || (gold === "miss" && row.gt_closest === false) || (gold === "hit" && row.gt_closest === true)
       || (gold === "error" && row.target_error) || (gold === "repairable" && row.repairable))
     && (!query || [row.doc_id, row.region_id, row.case_id].join(" ").toLowerCase().includes(query))
-  ));
+    );
+  });
+  q('#scope option[value="auto_hard"]').textContent = `已自动选定的难例（${scopeCounts.auto_hard}）`;
+  q('#scope option[value="needs_choice"]').textContent = `待人工选模（${scopeCounts.needs_choice}）`;
   q("#difficulty").innerHTML = Object.entries(difficultyLabels).map(([key,label]) =>
     `<button data-level="${key}" aria-pressed="${state.level === key}">${label} ${state.data.rows.filter(r => key === "all" || difficultyOf(r) === key).length}</button>`).join("");
   q("#bulk").hidden = state.level !== "easy";
   const count = state.rows.filter(eligible).length;
-  q("#bulk").textContent = `一键通过 ${count} 条 · 采用择优结果`;
+  q("#bulk").textContent = `批量采用 ${count} 条择优结果`;
   q("#bulk").disabled = !count || state.saving;
   q("#undo").hidden = !sessionStorage.getItem("undo-" + state.batch);
   const index = state.rows.findIndex(row => row.case_id === state.current);
@@ -541,7 +551,7 @@ function renderComparison() {
   const selection = row.selection;
   const automatic = selection.model_alias;
   const adopted = row.decision?.status === "approved" ? row.decision.model_alias : automatic;
-  const heading = row.decision?.status === "rejected" ? "已驳回 · 候选转录" :
+  const heading = row.decision?.status === "rejected" ? "已排除 · 候选转录" :
     !alias && selection.status === "needs_choice" ? "请选择模型转录" :
     alias === adopted || !alias ? "采用的 OCR 标签" : "候选转录预览";
   q("#selection-heading").textContent = heading;
@@ -556,7 +566,7 @@ function renderComparison() {
   q("#selection-detail").classList.toggle("needs-attention", selection.reasons.length > 0);
   const preview = row.baseline_views[alias];
   q("#selection-output").innerHTML = alias ? output(model.label, preview, false) : selection.status === "needs_choice"
-    ? '<p class="output-empty">请对照裁图选择一份转录。若全部有误，可驳回此样本。</p>'
+    ? '<p class="output-empty">请对照裁图选择一份转录。若全部有误，可排除此样本。</p>'
     : '<p class="output-empty">没有有效的 OCR 转录</p>';
   if (row.task === "table") {
     q("#selection-table").hidden = !preview?.rows;
@@ -572,7 +582,6 @@ function renderComparison() {
       ${on && visible.length === 1 ? "disabled" : ""}> ${esc(nameOf(key))}</label>`;
   }).join("");
   q("#model-pair").style.setProperty("--models", visible.length);
-  q("#adopt-model").value = alias;
   if (q("#comparison-details").open) {
     if (row.task === "table") {
       renderTablePreview(row, visible, base, views);
@@ -586,10 +595,10 @@ function renderComparison() {
   delete info.raw;
   delete info.label;
   q("#request-info").textContent = JSON.stringify(info, null, 2);
-  q("#review-choice").textContent = row.export_split ? "人工复核" : "评测判定";
-  q("#pass").disabled = !model.label || state.saving;
+  const action = model.label ? "采用 " + nameOf(alias) + " 的结果" : "请先选择候选";
+  q("#table-pass").textContent = action;
+  q("#table-pass").disabled = !model.label || state.saving;
   q("#reject").disabled = state.saving;
-  q("#table-pass").disabled = q("#pass").disabled;
   q("#table-reject").disabled = q("#reject").disabled;
 }
 
@@ -674,8 +683,7 @@ function renderCase() {
       </section>
       <details class="panel inspection-details" id="comparison-details" ${row.selection.status === "needs_choice" && !decision ? "open" : ""}><summary>各模型转录与判定依据</summary>
         <div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset>
-          <label>人工采用<select id="adopt-model"><option value="" disabled>选择转录</option>${Object.keys(row.models).filter(key => row.models[key].label).map(key =>
-            `<option value="${esc(key)}">${esc(nameOf(key))} · ${number(row.models[key].judge?.prob_yes)}</option>`).join("")}</select></label></div>
+</div>
         <section class="decision-summary">
           <div><h3>${listed?.queued ? (row.audit_sample ? "随机抽检入队" : "难例入队") : "未入审核队列"} · 判定依据</h3><div class="chips">${badges}</div>${evidenceDetails(row)}</div>
           <div class="priority"><span>排序分</span><strong>${number(row.priority)}</strong></div>
@@ -698,10 +706,12 @@ function renderCase() {
       </details>
     </div>
     <section class="review-dock" aria-label="人工复核">
-      <div class="review-selection" id="review-choice"></div>
+      <div class="review-selection"><strong>采用哪份转录？</strong><small id="review-choice"></small></div>
       <div class="review-actions">
-        <button id="reject" type="button" data-review="rejected">驳回</button>
-        <button id="pass" class="primary" type="button" data-review="approved">确认通过</button>
+        ${Object.keys(row.models).filter(key => row.models[key].label).map(key =>
+          `<button type="button" data-review="approved" data-alias="${esc(key)}"
+            title="${esc(row.models[key].label.slice(0, 180))}">${esc(nameOf(key))}</button>`).join("")}
+        <button id="reject" type="button" data-review="rejected">全部不采用</button>
       </div>
     </section>`;
   q("#comparison-details").addEventListener("toggle", event => {
@@ -724,16 +734,15 @@ function changeCase(offset) {
   if (next) selectCase(next.case_id, {reveal: true});
 }
 
-async function saveReview(status) {
-  if (state.saving || (status === "approved" && !state.case?.models[state.compare]?.label)) return;
+async function saveReview(status, alias = state.compare) {
+  if (state.saving || (status === "approved" && !state.case?.models[alias]?.label)) return;
   const path = casePath();
   const row = state.rows.find(item => item.case_id === state.current);
   const next = state.rows.slice(state.rows.indexOf(row) + 1).find(item => item.review_status === "pending")
     || state.rows.find(item => item.case_id !== state.current && item.review_status === "pending");
   state.saving = true;
   q("#batch").disabled = q("#import-open").disabled = true;
-  q("#pass").disabled = true;
-  q("#reject").disabled = true;
+  document.querySelectorAll("[data-review]").forEach(button => { button.disabled = true; });
   q("#table-pass").disabled = true;
   q("#table-reject").disabled = true;
   q("#table-feedback").textContent = "";
@@ -741,14 +750,16 @@ async function saveReview(status) {
   try {
     const decision = await api(path + "/decision", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({status, model_alias: state.compare || state.case.target_alias}),
+      body: JSON.stringify({status, model_alias: alias || state.case.target_alias}),
     });
     row.review_status = decision.status;
+    row.review_model = decision.model_alias;
     state.case.decision = decision;
+    if (status === "approved") state.compare = alias;
     state.saving = false;
     if (q("#table-dialog").open) q("#table-dialog").close();
     const destination = decision.sft ? " · 已存入 SFT 数据" : "";
-    notice("已记录 " + statuses[decision.status] + destination);
+    notice((decision.status === "approved" ? "已采用 " + nameOf(decision.model_alias) + " 的转录" : "已排除此样本") + destination);
     renderOverview();
     if (next) await selectCase(next.case_id, {reveal: true});
     else renderCase();
@@ -759,9 +770,8 @@ async function saveReview(status) {
   } finally {
     state.saving = false;
     q("#batch").disabled = q("#import-open").disabled = false;
-    if (state.case && q("#pass")) q("#pass").disabled = !state.case.models[state.compare]?.label;
-    if (q("#reject")) q("#reject").disabled = false;
-    q("#table-pass").disabled = Boolean(q("#pass")?.disabled);
+    document.querySelectorAll("[data-review]").forEach(button => { button.disabled = false; });
+    q("#table-pass").disabled = !state.case?.models[state.compare]?.label;
     q("#table-reject").disabled = false;
     updateNavigation();
   }
@@ -791,7 +801,8 @@ function updateTableDialog() {
 
 function showLargeTable() {
   const select = q("#table-model");
-  select.replaceChildren(...Object.keys(state.case.models).map(alias => new Option(nameOf(alias), alias)));
+  select.replaceChildren(new Option("选择转录", ""), ...Object.keys(state.case.models).filter(alias => state.case.models[alias].label).map(alias => new Option(nameOf(alias), alias)));
+  select.options[0].disabled = true;
   select.value = state.compare;
   const base = q("#table-base");
   base.replaceChildren(...Object.keys(state.case.models).map(alias=>new Option(nameOf(alias),alias)));
@@ -1001,7 +1012,7 @@ q("#inspection").addEventListener("click", event => {
     renderComparison();
     q(`[data-move="${axis}"][data-dir="${dir}"]:not(:disabled)`)?.focus();
   }
-  if (button.dataset.review) saveReview(button.dataset.review);
+  if (button.dataset.review) saveReview(button.dataset.review, button.dataset.alias);
   if (button.id === "open-table" || button.hasAttribute("data-open-sheet")) showLargeTable();
   if (button.dataset.image) {
     const isPage = button.dataset.page === "true";
@@ -1029,10 +1040,6 @@ q("#inspection").addEventListener("change", event => {
     renderComparison();
     Array.from(q("#visible-models").querySelectorAll("input")).find(input =>
       input.dataset.visible === event.target.dataset.visible)?.focus();
-  }
-  if (event.target.id === "adopt-model") {
-    if (!state.saving) state.compare = event.target.value;
-    renderComparison();
   }
   if (event.target.id === "only-changes") renderComparison();
   if (event.target.id === "difference") {
@@ -1296,7 +1303,7 @@ async function bulkReview(undo) {
     filterQueue();
     if (state.rows.some(row=>row.case_id === current)) await selectCase(current);
     renderOverview();
-    notice((undo ? "已撤销 " : "已批量通过 ") + result.changed.length + " 条");
+    notice((undo ? "已撤销 " : "已批量采用 ") + result.changed.length + " 条");
   } catch (error) { notice(error.message,true); }
   finally {
     state.saving = false;

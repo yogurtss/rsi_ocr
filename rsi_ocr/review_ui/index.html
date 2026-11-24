@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GlyphStack · 文档复核</title>
   <link rel="stylesheet" href="/assets/workbench.css">
-  <script src="/assets/workbench.js?v=human-choice-1" defer></script>
+  <script src="/assets/workbench.js?v=sample-selection-scopes" defer></script>
   <script src="/assets/settings.js" defer></script>
 </head>
 <body>
@@ -65,8 +65,10 @@
         <label class="visually-hidden" for="search">搜索样本</label>
         <input id="search" type="search" placeholder="搜索文档、区域或样本 ID">
           <label><span>样本范围</span><select id="scope">
-            <option value="all">全部样本</option><option value="queue">抽查队列</option>
-            <option value="needs_choice">待人工选模</option><option value="selection_check">择优有提示</option><option value="audit">随机抽审</option><option value="outside">未入队</option>
+            <option value="all">全部样本</option>
+            <option value="auto_hard">已自动选定的难例</option>
+            <option value="needs_choice">待人工选模</option><option value="queue">抽查队列</option>
+            <option value="selection_check">择优有提示</option><option value="audit">随机抽审</option><option value="outside">未入队</option>
           </select></label>
         <details class="advanced" id="queue-filters"><summary>筛选条件<span id="filter-count"></span></summary>
           <div id="difficulty" class="segments" aria-label="难度"></div>
@@ -77,7 +79,7 @@
           </div>
           <label><span>复核状态</span><select id="status">
             <option value="all">全部状态</option><option value="pending">未复核</option>
-            <option value="approved">已通过</option><option value="rejected">已驳回</option>
+            <option value="approved">已采用</option><option value="rejected">已排除</option>
             <option value="needs_check">待核查</option>
           </select></label>
           <label>入队原因<select id="reason"><option value="all">全部原因</option></select></label>
@@ -90,7 +92,7 @@
           </select></label>
           <button id="clear-filters" type="button">清除筛选</button>
         </details>
-        <button id="bulk" hidden></button><button id="undo" hidden>撤销上次批量通过</button>
+        <button id="bulk" hidden></button><button id="undo" hidden>撤销上次批量采用</button>
       </div>
       <div id="queue-list" class="queue-list"></div>
       <nav id="queue-pages" aria-label="样本目录分页" hidden><button id="queue-prev-page">上一页</button>
@@ -160,7 +162,7 @@
     <div class="dialog-bar">
       <strong>表格大图对照</strong>
       <div class="dialog-actions">
-        <label>基准<select id="table-base"></select></label><label>当前模型<select id="table-model"></select></label>
+        <label>基准<select id="table-base"></select></label><label>候选转录<select id="table-model"></select></label>
         <label>视图<select id="table-layout"><option value="pair">并排对照</option><option value="single">只看当前结果</option></select></label>
         <label>缩放<select id="table-zoom"><option value="0.8">80%</option><option value="1" selected>100%</option><option value="1.25">125%</option><option value="1.5">150%</option></select></label>
         <label><input type="checkbox" id="table-sync" checked>联动滚动</label><button id="table-prev">上一处差异</button><button id="table-next">下一处差异</button><form method="dialog"><button>关闭</button></form>
@@ -175,8 +177,8 @@
     <div id="table-dialog-content"></div>
     <div id="cell-detail" aria-live="polite"></div>
     <div class="table-review-actions"><span id="table-feedback" role="status"></span>
-      <button type="button" id="table-reject">驳回</button>
-      <button type="button" id="table-pass" class="primary">确认通过</button>
+      <button type="button" id="table-reject">所有候选均不采用</button>
+      <button type="button" id="table-pass" class="primary">采用所选结果</button>
     </div>
   </dialog>
 </body>

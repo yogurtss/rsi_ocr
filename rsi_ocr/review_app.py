@@ -65,7 +65,7 @@ def decision_record(row, status, alias):
               "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds")}
     if status == "approved":
         if not label:
-            raise ValueError("请选择一条可用的模型转录，再点「确认通过」")
+            raise ValueError("请选择有有效转录的模型")
         image = verified_image(row, record)
         if row.get("split", "mine") in SFT_SPLITS:
             record["sft"] = paddle_sft_record(image, row["task"], label)
@@ -628,6 +628,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
     def queue_entries(batch, recorded):
         for case_id, row in batch["rows"].items():
             target = row["target_state"]
+            status, model = recorded.get(case_id, ("pending", None))
             detail = batch["details"].get(case_id, {})
             comparison = detail.get("selection_gt", {})
             yield {
@@ -639,7 +640,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                 "selection_status": row["selection"]["status"],
                 "selection_flagged": bool(row["selection"].get("reasons")),
                 "queued": case_id in batch["queue"], "judge_status": target.get("judge", {}).get("status"),
-                "review_status": recorded.get(case_id, "pending"),
+                "review_status": status, "review_model": model,
                 "target_error": detail.get("target_error"), "repairable": detail.get("repairable"),
                 "gt_closest": comparison.get("is_closest") if comparison.get("valid_candidates", 0) >= 2 else None,
                 "exportable": row.get("split", "mine") in SFT_SPLITS,
@@ -651,7 +652,9 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         original = original_batch(batch_id)
         with closing(decision_db(original["path"] / "review.sqlite")) as db:
             batch = active_policy(original, db)
-            recorded = dict(db.execute("SELECT case_id, json_extract(payload, '$.status') FROM decisions"))
+            recorded = {key: (status, alias) for key, status, alias in db.execute(
+                "SELECT case_id, json_extract(payload, '$.status'), json_extract(payload, '$.model_alias') FROM decisions"
+            )}
         metadata = {"summary": batch["summary"], "report": batch["report"], "sources": batch["sources"],
                     "selection_gt": batch["selection_gt"], "original_thresholds": threshold_values(original["summary"]["mining"])}
         rows = queue_entries(batch, recorded)

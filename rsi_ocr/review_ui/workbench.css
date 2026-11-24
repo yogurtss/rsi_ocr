@@ -183,7 +183,7 @@ details > summary { color: var(--muted); font-size: .875rem; font-weight: 600; }
 .review-selection strong { color: var(--green); font-size: 1rem; }
 .review-selection span { color: var(--muted); font-size: .9rem; }
 .review-timestamp { color: var(--muted); font-size: .81rem; }
-.review-actions { display: flex; align-items: center; flex-shrink: 0; gap: 9px; }
+.review-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
 .review-actions button { min-height: 45px; min-width: 112px; font-weight: 710; padding-inline: 18px; }
 .review-actions #reject { border-color: #dbcacb; color: #90332c; }
 .review-actions #reject:hover { background: #fff0ed; border-color: #cc8e87; }
