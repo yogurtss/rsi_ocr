@@ -25,7 +25,20 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/runs/playwright" python -m playwright install --w
 
 **Jev SDK 随 GlyphStack 源码和 Python 包一起分发。** 默认配置直接使用内置 SDK，安装时只需克隆上面的 GlyphStack 仓库。模型权重单独下载，Chromium 和字体由本节命令安装。[内置 SDK 来源和许可证](rsi_ocr/_vendor/jev/README.md)
 
-### 2. 下载模型
+### 2. GPU 版面检测
+
+上一步安装的 `paddlepaddle` 用于默认的 CPU 版面检测。如果要在「模型部署 → 版面检测」选择 GPU，请在运行 Console 的同一个 Conda 环境中把 CPU 版替换成支持 CUDA 的 `paddlepaddle-gpu`。下面以 CUDA 12.6 为例，其他 CUDA 版本请按官方说明选择安装包。[PaddlePaddle GPU 安装说明](https://paddlepaddle.github.io/FastDeploy/get_started/installation/nvidia_gpu/)
+
+```bash
+conda activate "$PWD/runs/conda"
+python -m pip uninstall -y paddlepaddle
+python -m pip install 'paddlepaddle-gpu==3.3.1' \
+  -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+```
+
+已运行的 Console 需要重启。继续使用 CPU 版面检测时可跳过本节。
+
+### 3. 下载模型
 
 已有权重时，可在配置里指向现有目录，并安装已有 OXR 目录中的插件。首次下载使用下列命令。OXR 和 OvisOCR3 需要完整模型目录，分别包含 vLLM 插件和 OCR 提示文件。
 
@@ -89,6 +102,7 @@ glyphstack status --port 8520                 # 查看模型和任务状态
 | 无法连接后台 | 确认终端 1 仍在运行，`--port` 与配置中的 `manager_port` 一致。 |
 | 提示权重缺失或模型加载失败 | 核对 `deployment.model_root`、各模型的 `path` 和 GPU 编号。用 `glyphstack status --port 8520` 查找任务的输出目录，再看其中对应模型的日志。手动启动模型的日志在 `<output_root>/.manager/`。 |
 | OXR 无法注册或 Ovis 缺提示文件 | 确认已安装 `OXR-1.0/plugins/vllm`，并确认 Ovis 权重目录中存在 `prompts/plain_ocr.txt`。 |
+| 提示「GPU 版面检测需要支持 CUDA 的 paddlepaddle-gpu」 | 按 [GPU 版面检测](#2-gpu-版面检测) 在 Console 使用的 Conda 环境里替换 CPU 版，然后重启 Console。 |
 | Jev 找不到 `sdk/app.py` | 新版默认从安装包加载 SDK。确认 Console 使用的是新版，再检查自用 YAML 中的 `deployment.minicpm_repo`。配置中删掉该覆盖项即可使用内置 SDK。 |
 | Jev 引擎启动后渲染仍失败 | 看 `jev-render.log`，检查 Node.js、Chromium 的安装路径、系统库和 CJK 字体。 |
 | Jev 报 `No available memory for the cache blocks` | 看 `jev.log`。可先在 `deployment.models.jev` 中设置 `max_sequences: 4` 以降低启动时的显存需求，然后重启 Console。 |
@@ -146,13 +160,7 @@ glyphstack stop all --port 8520            # 命令行卸载全部模型
 
 在「版面检测」模型行可以设置权重路径和设备，默认使用 `PP-DocLayoutV3` 和 CPU。选择 GPU 后填写设备编号，例如 `0` 或 `1`，保存后用于后续批次。YAML 中对应 `deployment.models.layout: {path: PP-DocLayoutV3, device: gpu:0}`。编号从 0 开始，按 Console 环境可见的 GPU 顺序计算，可与 PaddleOCR-VL 识别服务的 GPU 分开指定。单卡部署时，GPU 版面检测和 PaddleOCR-VL 识别共用这张卡的显存。
 
-GPU 版面检测需要在 Console 所用的 Python 环境中用 `paddlepaddle-gpu` 替换 CPU 版。以下命令以 CUDA 12.6 为例，安装后重启 Console。[PaddlePaddle GPU 安装说明](https://paddlepaddle.github.io/FastDeploy/get_started/installation/nvidia_gpu/)
-
-```bash
-python -m pip uninstall -y paddlepaddle
-python -m pip install 'paddlepaddle-gpu==3.3.1' \
-  -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-```
+保留原来的 Conda 环境，并按 [GPU 版面检测](#2-gpu-版面检测) 安装 CUDA 版 PaddlePaddle。
 
 例如将 `deployment.models.ovis` 设为 `{enabled: true, path: OvisOCR3, port: 8102, context: 16384, gpu: "1", gpu_memory: 0.75, max_sequences: 4}`，Ovis 就会部署到 GPU 1。跨卡模型可同时设置 `gpu: "2,3"` 和 `tensor_parallel: 2`。在页面保存时，受变更影响的服务会卸载，常驻模式会按新配置启动。切换到串行按需模式会卸载常驻模型。直接编辑 YAML 后，可选中对应卡片按 **T** 重读该模型的配置，启用的模型会重启。
 
