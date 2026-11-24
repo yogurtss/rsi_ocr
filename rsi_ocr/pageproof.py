@@ -39,7 +39,7 @@ def endpoint(port, path, payload=None, timeout=5):
 def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
     from rich.console import Console
     from rich.live import Live
-    from .console_view import console_view
+    from .console_view import console_view, progress_page_size
 
     fd = sys.stdin.fileno()
     original = termios.tcgetattr(fd)
@@ -50,7 +50,9 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
     last_refresh = 0.0
     console = Console()
     expanded = False
+    progress_page = None
     show_model_log = model_logs is not None and console.width >= 100
+    log_source = "auto"
     model_log = None
     last_message = ""
     concurrency_input = None
@@ -62,9 +64,9 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
                     snap = snapshot()
                     if show_model_log:
                         try:
-                            model_log = model_logs(selected)
+                            model_log = model_logs(log_source)
                         except (ValueError, OSError) as error:
-                            model_log = [f"读取模型日志失败 · {error}"]
+                            model_log = {log_source: [f"读取模型日志失败 · {error}"]}
                     last_refresh = time.monotonic()
                 frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 7) % 10]
                 message = last_message
@@ -72,7 +74,8 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
                     limit = snap["models"][selected].get("max_sequences", "—")
                     message = f"{selected} 并发 {limit} → {concurrency_input or '_'}   Enter 提交 · Esc 取消"
                 live.update(console_view(snap, selected, message, expanded, console.width, console.height,
-                                         time.time(), frame, model_log=model_log if show_model_log else None), refresh=True)
+                                         time.time(), frame, model_log=model_log if show_model_log else None,
+                                         progress_page=progress_page, log_source=log_source), refresh=True)
                 if select.select([fd], [], [], 0.18)[0]:
                     key = os.read(fd, 1).decode(errors="ignore").lower()
                     if key == "\x1b" and select.select([fd], [], [], 0.02)[0]:
@@ -92,8 +95,22 @@ def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
                             concurrency_input = concurrency_input[:-1]
                         elif key.isascii() and key.isdigit():
                             concurrency_input += key
-                    elif key in ("1", "2", "3", "4"):
+                    elif key == "g":
+                        progress_page = 0 if progress_page is None else None
+                    elif progress_page is not None:
+                        if key == "\x1b":
+                            progress_page = None
+                        elif key in ("[", "]") and snap.get("batch_progress"):
+                            stages = snap["batch_progress"]["stages"]
+                            size = progress_page_size(console.height, len(stages))
+                            last = max(0, (len(stages["render"]["docs"]) - 1) // size)
+                            progress_page = min(last, max(0, progress_page + (1 if key == "]" else -1)))
+                    elif key == "0":
+                        log_source = "auto"
+                        last_refresh = 0.0
+                    elif key in ("1", "2", "3", "4") and int(key) <= len(aliases):
                         selected = aliases[int(key) - 1]
+                        log_source = selected
                         last_refresh = 0.0
                     elif key == "c":
                         concurrency_input = ""
@@ -148,7 +165,7 @@ def main(argv=None):
             if interactive:
                 def terminal(current):
                     dashboard(current.snapshot, current.enqueue, current.closed.is_set,
-                              model_logs=current.model_log_tail)
+                              model_logs=current.console_log_tails)
 
             uvicorn.run(manager_app(manager, terminal), host="127.0.0.1",
                         port=port, log_level="warning" if interactive else "info", access_log=False)
@@ -159,7 +176,7 @@ def main(argv=None):
                       lambda action, value, **options: endpoint(
                           args.port, "/jobs", {"action": action, "value": value, **options}
                       )["id"],
-                      model_logs=lambda alias: endpoint(args.port, f"/model-logs/{alias}", timeout=2))
+                      model_logs=lambda source: endpoint(args.port, f"/model-logs?source={source}", timeout=2))
         elif args.command in {"studio", "status"}:
             snap = endpoint(args.port, "/status")
             if snap.get("service") != "pageproof":

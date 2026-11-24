@@ -269,6 +269,78 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("rsi_ocr_region", args)
         self.assertEqual(json.loads(env["RSI_OCR_REWARD_WEIGHTS"]), self.config["reward"])
 
+    def test_downstream_resume_reuses_finished_requests_before_loading_models(self):
+        from rsi_ocr.local import run_local
+
+        batch = self.root / "first"
+        batch.mkdir()
+        manifest = batch / "regions.jsonl"
+        rows = []
+        for page in (1, 2, 3):
+            image = f"{page}.png"
+            (batch / image).write_bytes(PNG + bytes([page]))
+            rows.append({"doc_id": "scan", "page_id": page, "region_id": "0", "image": image, "task": "text",
+                         "target": {"status": "ok", "raw": str(page), "format": "text"}})
+        write_rows(manifest, rows)
+        self.config["mining"]["workers"] = 1
+        loaded = []
+        calls = []
+        logs = []
+        stopped = None
+
+        @contextmanager
+        def session(alias, _):
+            loaded.append(alias)
+            yield
+
+        def run(alias, directory=batch):
+            run_local(self.config, directory, [(manifest, directory / "production")], stage=alias,
+                      session=session, progress=logs.append)
+
+        def request(service, path, payload):
+            if path.endswith("/score"):
+                alias = "jev"
+                image = base64.b64decode(payload["items"][0]["image"])
+            else:
+                alias = next(name for name, spec in self.config["models"].items() if spec == service.config)
+                data = payload["messages"][0]["content"][0]["image_url"]["url"]
+                image = base64.b64decode(data.partition(",")[2])
+            page = image[-1]
+            if alias == stopped and page >= 2:
+                raise RuntimeError("interrupted")
+            calls.append((alias, page))
+            if alias == "jev":
+                return {"results": [{"verdict": "scored", "prob_yes": 0.75} for _ in payload["items"]]}
+            return chat(f"{alias} {page}")
+
+        with patch.object(Service, "request", autospec=True, side_effect=request):
+            run("oxr")
+            for alias in ("ovis", "jev"):
+                stopped = alias
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    run(alias)
+                stopped = None
+                run(alias)
+            self.assertEqual(loaded, ["oxr", "ovis", "ovis", "jev", "jev"])
+            self.assertEqual(calls, [(a, p) for a in ("oxr", "ovis", "jev") for p in (1, 2, 3)])
+            loaded.clear()
+            calls.clear()
+            new = self.root / "second"
+            new.mkdir()
+            (new / ".previous-batch").write_text(batch.name)
+            for directory in (batch, new):
+                for alias in ("oxr", "ovis", "jev"):
+                    run(alias, directory)
+            self.assertEqual(loaded, [])
+            self.assertEqual(calls, [])
+            self.assertTrue(any("jev 请求 · 复用 3" in msg and "跳过推理" in msg for msg in logs))
+            self.assertEqual(list(read_rows(new / "production/evidence.jsonl")),
+                             list(read_rows(batch / "production/evidence.jsonl")))
+            self.config["models"]["oxr"]["revision"] += "-updated"
+            run("oxr", new)
+            self.assertEqual(loaded, ["oxr"])
+            self.assertEqual(calls, [("oxr", n) for n in (1, 2, 3)])
+
     def test_local_batch_mines_without_teachers_or_jev(self):
         from rsi_ocr.importer import runtime_config
         from rsi_ocr.local import run_local

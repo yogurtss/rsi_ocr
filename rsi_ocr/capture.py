@@ -17,7 +17,7 @@ from threading import Lock, Thread
 from .config import expand
 from .importer import InputChangedError, RenderPlan
 from .service import Service, ServiceError, chat_result
-from .store import atomic_output, digest, json_text, read_rows, write_rows
+from .store import atomic_output, digest, json_text, previous_batch, read_rows, write_rows
 
 
 def locate_crops(image, boxes, root, rows):
@@ -208,14 +208,8 @@ def capture_plan(config, manifest, root, check_cancelled=None, *, records=None):
     target = config["models"][config["mining"]["target"]]
     options = config["capture"]
     identity = [expand(target["base_url"]), target["model"], target["revision"], target["tasks"], "layout-bbox-v1"]
-    previous = None
-    marker = root.parent / ".previous-batch"
-    if marker.is_file():
-        name = marker.read_text(encoding="utf-8").strip()
-        if name and name != ".." and Path(name).name == name:
-            candidate = root.parent.parent / name
-            if candidate.is_dir() and not candidate.is_symlink():
-                previous = candidate
+    previous = previous_batch(root.parent)
+
     def shard_paths(directory, page, page_image, image_hash):
         parts = [page, str(page_image), image_hash, options, *identity]
         new_key = digest(json_text([*parts, target.get("local_weights")]).encode())
@@ -294,7 +288,7 @@ def layout_checkpoint(detector, shard, report):
 
 
 @contextmanager
-def rendered_entries(config, source, root, plan, progress, check_cancelled):
+def rendered_entries(config, source, root, plan, progress, check_cancelled, report_work):
     if not isinstance(source, RenderPlan):
         yield iter(plan)
         return
@@ -303,11 +297,15 @@ def rendered_entries(config, source, root, plan, progress, check_cancelled):
         with closing(source.images(progress, check_cancelled)) as images:
             for entry in plan:
                 row = next(images)
+                if report_work:
+                    report_work("render", row["doc_id"])
                 if entry.shard is None:
                     entry, = capture_plan(config, source.manifest, root, records=[row])
                 yield entry
             # Exhaust the renderer to publish the complete page manifest.
             next(images, None)
+            if report_work:
+                report_work("render", finished=True)
 
     # Keep PDFium on one thread, including releasing its document on early exit.
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-render") as pool:
@@ -341,7 +339,8 @@ def _capture_gpu_worker(config, manifest, root, messages, plan=None):
         try:
             capture_pages(config, manifest, root, progress=lambda text: send("progress", text),
                           report_device=lambda device: send("device", device), plan=plan,
-                          report_page=lambda state: send("page", state))
+                          report_page=lambda state: send("page", state),
+                          report_work=lambda *args, **kwargs: send("work", (args, kwargs)))
         except InputChangedError as error:
             send("input_changed", str(error))
         except Exception as error:
@@ -350,7 +349,7 @@ def _capture_gpu_worker(config, manifest, root, messages, plan=None):
 
 
 def capture_gpu_pages(config, manifest, root, progress=None, check_cancelled=None, report_device=None,
-                      plan=None, report_page=None):
+                      plan=None, report_page=None, report_work=None):
     """Release Paddle's CUDA context before handing the GPU to the next model."""
     root.mkdir(parents=True, exist_ok=True)
     context = get_context("spawn")
@@ -379,6 +378,10 @@ def capture_gpu_pages(config, manifest, root, progress=None, check_cancelled=Non
                 elif kind == "page":
                     if report_page:
                         report_page(message)
+                elif kind == "work":
+                    if report_work:
+                        args, kwargs = message
+                        report_work(*args, **kwargs)
                 elif progress:
                     progress(message)
             while worker.is_alive():
@@ -415,7 +418,7 @@ def prepared_layout(inner, source, result):
 
 
 def capture_pages(config, manifest, root, progress=None, report_device=None, plan=None, report_page=None,
-                  check_cancelled=None):
+                  check_cancelled=None, report_work=None):
     root.mkdir(parents=True, exist_ok=True)
     target = config["models"][config["mining"]["target"]]
     recorder = Recorder(target, root)
@@ -502,7 +505,8 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                     locate_crops(entry.image, boxes, root, recorder.rows)
         if not received_page:
             raise RuntimeError(f"PaddleOCR 未返回页面结果 · {entry.image}")
-        if all(row["target"]["status"] != "service_error" for row in recorder.rows):
+        failed = any(row["target"]["status"] == "service_error" for row in recorder.rows)
+        if not failed:
             write_rows(shard, recorder.rows)
             seconds = monotonic() - started
             request_seconds = recorder.request_seconds()
@@ -512,6 +516,8 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                          f"单页 {seconds:.1f} 秒 · vLLM 请求 {request_seconds:.1f} 秒")
         elif progress:
             progress(f"区域服务错误 · {entry.image} · 下次重试 OCR")
+        if report_work:
+            report_work("paddle", page["doc_id"], failed=failed)
         return recorder.rows
 
     pipeline = inner = detector = None
@@ -523,7 +529,7 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
         pending = None
         predict = options.get("predict", {})
         with ExitStack() as stack:
-            entries = stack.enter_context(rendered_entries(config, manifest, root, plan, progress, check_cancelled))
+            entries = stack.enter_context(rendered_entries(config, manifest, root, plan, progress, check_cancelled, report_work))
             for index, entry in enumerate(entries):
                 if check_cancelled:
                     check_cancelled()
@@ -533,6 +539,8 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                         pending = None
                     if not plan[index].cached:
                         update(entry, "复用整页")
+                        if report_work:
+                            report_work("paddle", entry.page["doc_id"])
                     yield from read_rows(entry.shard)
                     continue
                 if pipeline is None:

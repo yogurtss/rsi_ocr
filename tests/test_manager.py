@@ -75,6 +75,7 @@ class ManagerTests(unittest.TestCase):
             manager.start()
             try:
                 self.assertEqual(manager.model_log_tail("oxr"), [])
+                self.assertEqual(manager.console_log_tails(), {})
                 manager.enqueue("start", "paddle")
                 manager.enqueue("start", "paddle")
                 manager.enqueue("start", "oxr")
@@ -93,6 +94,8 @@ class ManagerTests(unittest.TestCase):
                 model_lines = manager.model_log_tail("oxr")
                 self.assertEqual(len(model_lines), 64)
                 self.assertEqual(model_lines[-1], "vLLM 启动")
+                self.assertEqual(manager.console_log_tails(), {"oxr": model_lines})
+                self.assertEqual(manager.console_log_tails("paddle"), {"paddle": []})
                 with (Path(temp) / ".manager/oxr.log").open("a", encoding="utf-8") as stream:
                     stream.write("vLLM 新一行\n")
                 self.assertEqual(manager.model_log_tail("oxr")[-1], "vLLM 新一行")
@@ -103,7 +106,10 @@ class ManagerTests(unittest.TestCase):
         from rsi_ocr.manager import Manager
 
         @contextmanager
-        def session(*args):
+        def session(config, alias, output, cancelled):
+            (output / f"{alias}.log").write_text(f"{alias} engine ready\n")
+            if alias == "jev":
+                (output / "jev-render.log").write_text("sidecar ready\n")
             yield [Mock(poll=lambda: None)]
 
         with TemporaryDirectory() as directory, patch("rsi_ocr.manager.model_session", session), patch(
@@ -123,6 +129,9 @@ class ManagerTests(unittest.TestCase):
                 self.assertEqual(load_config(path)["deployment"]["mode"], "managed")
                 self.assertEqual(self.wait_for_job(manager, next(iter(manager.jobs)))["status"], "done")
                 self.assertEqual(set(manager.sessions), {"paddle", "oxr", "ovis", "jev"})
+                self.assertEqual(manager.console_log_tails(),
+                                 {alias: [f"{alias} engine ready"] for alias in manager.sessions})
+                self.assertEqual(manager.console_log_tails("jev"), {"jev": ["jev engine ready"]})
                 manager.set_mode("on_demand")
                 self.assertEqual(self.wait_for_job(manager, list(manager.jobs)[-1])["status"], "done")
                 self.assertFalse(manager.sessions)
@@ -180,7 +189,7 @@ class ManagerTests(unittest.TestCase):
         stages = []
         teachers = Barrier(2)
 
-        def run_stage(*args, stage, session, progress, check_cancelled, layout_session, report_page):
+        def run_stage(*args, stage, session, progress, check_cancelled, layout_session, report_page, report_work):
             stages.append(stage)
             progress(f"执行 {stage}")
             if stage == "paddle":

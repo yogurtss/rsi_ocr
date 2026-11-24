@@ -23,9 +23,10 @@ class ServiceError(Exception):
 
 
 class Service:
-    def __init__(self, config, cache=None):
+    def __init__(self, config, cache=None, resume=None):
         self.config = config
         self.cache = cache
+        self.resume = resume
         self.cache_only = False
         self.slots = BoundedSemaphore(config.get("concurrency", 4))
 
@@ -44,28 +45,36 @@ class Service:
         except (URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as error:
             raise ServiceError(f"{url}: {error}") from error
 
-    def cached(self, path, payload, convert):
+    def cached(self, path, payload, convert, region=None):
         key = digest(json_text([
             expand(self.config["base_url"]), self.config["model"],
             self.config["revision"], path, payload,
         ]).encode())
         hit = self.cache.get(key) if self.cache else None
         if hit is not None:
+            if self.resume:
+                self.resume.record("reused")
             return hit
         if self.cache_only:
             raise ServiceError(f"missing cached response for {self.config['model']} at {path}; run warm first")
+        if self.resume:
+            self.resume.ensure_loaded(region)
         start = time.perf_counter()
         try:
             result = convert(self.request(path, payload))
         except (ServiceError, KeyError, IndexError, TypeError, ValueError) as error:
+            if self.resume:
+                self.resume.record("failed")
             return {"status": "service_error", "detail": str(error)}
         result["latency_s"] = round(time.perf_counter() - start, 4)
         transient = {"service_error", "forward_error", "render_error", "encode_error"}
         if self.cache and result["status"] not in transient:
             self.cache.put(key, result)
+        if self.resume:
+            self.resume.record("failed" if result["status"] in transient else "done")
         return result
 
-    def read(self, task, image):
+    def read(self, task, image, region=None):
         spec = self.config["tasks"][task]
         payload = {
             "model": self.config["model"],
@@ -78,10 +87,10 @@ class Service:
             **self.config.get("request", {}),
             **spec.get("request", {}),
         }
-        result = self.cached("/chat/completions", payload, chat_result)
+        result = self.cached("/chat/completions", payload, chat_result, region)
         return {**result, "prompt": spec["prompt"], "format": spec["format"]}
 
-    def score(self, task, image, candidates):
+    def score(self, task, image, candidates, region=None):
         payload = {
             "input_form": "ternary",
             "items": [
@@ -106,7 +115,7 @@ class Service:
             status = next((row["status"] for row in entries if row["status"] in failures), "ok")
             return {"status": status, "entries": entries}
 
-        result = self.cached("/v1/rm/score", payload, convert)
+        result = self.cached("/v1/rm/score", payload, convert, region)
         if "entries" not in result:
             return [result.copy() for _ in candidates]
         return result["entries"]

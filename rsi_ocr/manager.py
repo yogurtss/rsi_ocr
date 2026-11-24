@@ -7,7 +7,7 @@ from pathlib import Path
 from queue import Queue
 from tempfile import TemporaryDirectory
 from threading import Event, RLock, Thread
-from time import time
+from time import monotonic, time
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -25,6 +25,7 @@ from .local import (
     model_session, run_local, set_concurrency,
 )
 from .store import atomic_output
+from .progress import BatchProgress, STAGE_NAMES, overall
 
 
 class Manager:
@@ -40,6 +41,8 @@ class Manager:
         self.config = local_config(settings, base)
         self.layout_runtime = {"status": "idle", "device": None}
         self.capture_progress = {}
+        self.batch_progress = None
+        self.progress_log_times = {}
         self.base = base
         self.policy = self.config["mining"]
         apply_model_selection(self.config, self.policy)
@@ -147,6 +150,34 @@ class Manager:
                         if key in state}
             self.capture_progress = {**state, "last_page": last}
 
+    def report_work(self, name, doc=None, *, totals=None, completed=None, failed=False, started=False, finished=False):
+        with self.lock:
+            batch = self.batch_progress
+            stage = batch.stages[name]
+            if totals is not None:
+                batch.plan(name, totals, completed or {})
+                return
+            if finished:
+                stage["finished"] = True
+            elif started:
+                stage["current"] = batch.current_doc = doc
+                return
+            else:
+                batch.advance(name, doc, failed)
+            now = monotonic()
+            if not finished and now - self.progress_log_times.get(name, 0) < 2:
+                return
+            self.progress_log_times[name] = now
+            unit = "页" if name in ("render", "paddle") else "区域"
+            message = (f"总进度 {int(overall(batch.stages) * 100)}% · {STAGE_NAMES[name]} "
+                       f"{stage['processed']}/{stage['total']} {unit}")
+            if doc:
+                done, total, _ = stage["docs"][doc]
+                message += f" · {doc} {done}/{total} {unit}"
+            if stage["errors"]:
+                message += f" · 错误 {stage['errors']}"
+            self.log(message)
+
     def report_layout_device(self, device):
         with self.lock:
             self.layout_runtime["device"] = device
@@ -180,6 +211,7 @@ class Manager:
                     "layout": self.config["layout"].copy(), "layout_device": self.config["layout"]["device"],
                     "layout_runtime": self.layout_runtime.copy(),
                     "capture_progress": self.capture_progress.copy(),
+                    "batch_progress": self.batch_progress.snapshot() if self.batch_progress else None,
                     "capture_queues": self.config["capture"].get("predict", {}).get("use_queues",
                                       self.config["capture"].get("pipeline", {}).get("use_queues", True)),
                     "output_root": str(self.root), "input_path": str(self.default_input),
@@ -241,6 +273,23 @@ class Manager:
         if offset:
             text = text.partition("\n")[2]
         return text.splitlines()[-64:]
+
+    def console_log_tails(self, source="auto"):
+        if source == "auto":
+            with self.lock:
+                recent = list(reversed(self.model_logs))
+                active = [alias for alias in recent if self.models[alias]["status"] in
+                          {"starting", "healthy", "unhealthy", "stopping"}]
+                aliases = active or recent[:1]
+        else:
+            aliases = [source]
+        tails = {}
+        for alias in aliases:
+            try:
+                tails[alias] = self.model_log_tail(alias)
+            except OSError as error:
+                tails[alias] = [f"读取日志失败 · {error}"]
+        return tails
 
     def update_job(self, job, **values):
         with self.lock:
@@ -402,6 +451,7 @@ class Manager:
         with self.lock:
             self.check_closing()
             path = output / (alias + ".log")
+            self.model_logs.pop(alias, None)
             self.model_logs[alias] = path
             self.models[alias].update(status="starting", detail=str(path))
             self.log(f"正在加载模型 · {alias} · GPU {self.models[alias]['gpu']}")
@@ -436,6 +486,9 @@ class Manager:
     def infer(self, job):
         with self.lock:
             self.capture_progress = {}
+            policy = self.config["mining"]
+            self.batch_progress = BatchProgress(policy["teachers"], policy.get("judge"))
+            self.progress_log_times.clear()
             self.layout_runtime = {"status": "idle", "device": None}
         if self.mode == "managed":
             missing = [alias for alias in mining_models(self.config["mining"]) if not self.is_ready(alias)]
@@ -470,7 +523,8 @@ class Manager:
             def stage(alias):
                 run_local(config, output, jobs, pages, stage=alias, session=lambda *_: nullcontext(),
                           progress=self.report_progress, check_cancelled=self.check_closing,
-                          layout_session=self.layout_session, report_page=self.report_capture_page)
+                          layout_session=self.layout_session, report_page=self.report_capture_page,
+                          report_work=self.report_work)
 
             self.update_job(job, stage="版面与基线识别")
             stage(policy["target"])
@@ -484,7 +538,8 @@ class Manager:
         try:
             run_local(config, output, jobs, pages,
                       session=use_model, progress=self.report_progress, check_cancelled=self.check_closing,
-                      layout_session=self.layout_session, report_page=self.report_capture_page)
+                      layout_session=self.layout_session, report_page=self.report_capture_page,
+                      report_work=self.report_work)
         finally:
             self.unload_all()
 
@@ -583,7 +638,8 @@ def manager_app(manager, terminal=None):
 
     @app.middleware("http")
     async def local_client(request: Request, call_next):
-        needs_client = request.method == "POST" or request.url.path.startswith("/model-logs/")
+        path = request.url.path
+        needs_client = request.method == "POST" or path == "/model-logs" or path.startswith("/model-logs/")
         if needs_client and request.headers.get("X-PageProof-Client") != "cli":
             return JSONResponse({"detail": "请使用本机 GlyphStack 客户端"}, status_code=403)
         return await call_next(request)
@@ -602,6 +658,13 @@ def manager_app(manager, terminal=None):
             raise HTTPException(404, str(error)) from error
         except OSError as error:
             raise HTTPException(503, str(error)) from error
+
+    @app.get("/model-logs")
+    def console_logs(source: str = "auto"):
+        try:
+            return manager.console_log_tails(source)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
 
     @app.get("/jobs/{job_id}")
     def job_status(job_id: str):

@@ -5,8 +5,10 @@ import re
 import signal
 import subprocess
 import time
+from collections import Counter
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
+from threading import Lock
 
 from rsi_ocr.capture import capture_gpu_pages, capture_pages, capture_plan
 from rsi_ocr.config import load_config
@@ -133,8 +135,52 @@ def apply_model_selection(config, policy):
                         "judge": judge if judge and enabled(judge) else None}
 
 
+class ModelResume:
+    """Open one model session per stage, on the first uncached request across workers."""
+
+    def __init__(self, alias, stack, use_model, progress):
+        self.alias = alias
+        self.stack = stack
+        self.use_model = use_model
+        self.log = progress or (lambda message: print(message, flush=True))
+        self.lock = Lock()
+        self.loaded = False
+        self.load_error = None
+        self.counts = {"reused": 0, "done": 0, "failed": 0}
+        self.last_report = time.monotonic()
+
+    def ensure_loaded(self, region):
+        with self.lock:
+            if self.load_error is not None:
+                raise RuntimeError(f"{self.alias} 加载失败") from self.load_error
+            if not self.loaded:
+                self.log(f"{self.alias} 首个待处理区域 · {region['doc_id']} 第 {region['page_id']} 页 "
+                         f"· 区域 {region['region_id']}")
+                try:
+                    self.stack.enter_context(self.use_model(self.alias))
+                except Exception as error:
+                    self.load_error = error
+                    raise
+                self.loaded = True
+
+    def record(self, outcome):
+        with self.lock:
+            self.counts[outcome] += 1
+            if time.monotonic() - self.last_report >= 2:
+                self.report()
+                self.last_report = time.monotonic()
+
+    def report(self, finished=False):
+        counts = self.counts
+        message = (f"{self.alias} 请求 · 复用 {counts['reused']} · 本次完成 {counts['done']} "
+                   f"· 错误 {counts['failed']}")
+        if finished and not self.loaded:
+            message += " · 跳过推理"
+        self.log(message)
+
+
 def run_local(config, output, jobs, pages=None, stage="all", session=None, progress=None, check_cancelled=None,
-              layout_session=nullcontext, report_page=None):
+              layout_session=nullcontext, report_page=None, report_work=None):
     output.mkdir(parents=True, exist_ok=True)
     policy = config["mining"]
     target = policy["target"]
@@ -154,12 +200,17 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
         capture_root = output / "capture"
         capture_stage = alias == target and pages is not None
         plan = None
-        needs_model = True
+        needs_model = alias == target
         if capture_stage:
             if progress:
                 progress("检查整页断点 · " + str(capture_root))
             pages = pages if isinstance(pages, RenderPlan) else pages.resolve()
             plan = capture_plan(config, pages, capture_root, check_cancelled)
+            if report_work:
+                totals = Counter(entry.page["doc_id"] for entry in plan)
+                if isinstance(pages, RenderPlan):
+                    report_work("render", totals=pages.counts)
+                report_work("paddle", totals=totals, completed=Counter(e.page["doc_id"] for e in plan if e.cached))
             reused = sum(entry.cached for entry in plan)
             pending = next((entry.page for entry in plan if not entry.cached), None)
             message = f"版面与 OCR · 复用 {reused}/{len(plan)} 页 · 待处理 {len(plan) - reused} 页"
@@ -176,20 +227,30 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
             needs_model = pending is not None or any(
                 manifest.resolve() != (capture_root / "regions.jsonl").resolve() for manifest, _ in jobs
             )
-        with (use_model(alias) if needs_model else nullcontext()):
+        region_totals = None
+        if capture_stage and report_work:
+            region_totals = {name: Counter() for name in [*policy["teachers"], policy.get("judge") or "mine"]}
+        with ExitStack() as stack:
+            resume = None
+            if needs_model:
+                stack.enter_context(use_model(alias))
+            if alias != target:
+                resume = ModelResume(alias, stack, use_model, progress)
+                resume.log(f"{alias} 转录 · 检查区域缓存")
             if capture_stage:
                 device = config["capture"].get("pipeline", {}).get("device", "cpu")
                 with layout_session() as report_device:
                     if pending and str(device).partition(":")[0] == "gpu":
                         capture_gpu_pages(config, pages, output / "capture", progress=progress,
                                           check_cancelled=check_cancelled, report_device=report_device,
-                                          plan=plan, report_page=report_page)
+                                          plan=plan, report_page=report_page, report_work=report_work)
                     else:
                         capture_pages(config, pages, output / "capture", progress=progress,
                                       report_device=report_device, plan=plan, report_page=report_page,
-                                      check_cancelled=check_cancelled)
+                                      check_cancelled=check_cancelled, report_work=report_work)
             for manifest, run in jobs:
-                counts = warm(config, manifest, run, alias, check_cancelled=check_cancelled)
+                counts = warm(config, manifest, run, alias, check_cancelled=check_cancelled, resume=resume,
+                              report_work=report_work if alias != target else None, region_totals=region_totals)
                 if progress:
                     progress(f"{alias} 转录完成 · {sum(counts.values())} 个区域 · "
                              f"{counts.get('service_error', 0)} 个服务错误")
@@ -197,17 +258,32 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
                     print(f"{alias} {run.name} {json_text(counts)}", flush=True)
                 if counts.get("service_error"):
                     raise RuntimeError(f"{alias} returned service errors for {run.name}; see {output}")
+            if resume:
+                resume.report(finished=True)
+        if report_work:
+            report_work(alias, finished=True)
+            if region_totals is not None:
+                for name, totals in region_totals.items():
+                    report_work(name, totals=totals)
     judge = policy.get("judge")
     if stage in ("all", judge or "mine"):
         if check_cancelled:
             check_cancelled()
-        with (use_model(judge) if judge else nullcontext()):
+        with ExitStack() as stack:
+            resume = ModelResume(judge, stack, use_model, progress) if judge else None
+            if resume:
+                resume.log(f"{judge} 评分 · 检查区域缓存")
             for manifest, run in jobs:
-                summary = mine(config, manifest, run, cached_readers=True, check_cancelled=check_cancelled)
+                summary = mine(config, manifest, run, cached_readers=True, check_cancelled=check_cancelled,
+                               resume=resume, report_work=report_work)
                 if progress:
                     progress(f"筛选完成 · 扫描 {summary['scanned']} 个区域 · {summary['review']} 个待复核")
                 else:
                     print(f"{run.name} {json_text(summary)}", flush=True)
+            if resume:
+                resume.report(finished=True)
+        if report_work:
+            report_work(judge or "mine", finished=True)
 
 
 def local_config(settings, base):

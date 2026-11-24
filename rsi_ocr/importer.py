@@ -9,7 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .config import load_config, resolve_config
-from .store import atomic_output, digest, json_text, write_rows
+from .store import atomic_output, digest, json_text, previous_batch, write_rows
 
 
 def input_files(source, settings, excluded):
@@ -217,13 +217,9 @@ def render_pages(source, output, settings, progress=None, *, reuse_existing=Fals
     rows = []
     dpi = render_dpi(settings)
     # A completed batch with the same input fingerprint can supply its rendered PNGs too.
-    marker = output.parent / ".previous-batch"
-    previous = None
-    if indexed and marker.is_file():
-        name = marker.read_text(encoding="utf-8").strip()
-        candidate = output.parent.parent / name
-        if name and name != ".." and Path(name).name == name and not candidate.is_symlink():
-            previous = candidate / "input"
+    previous = previous_batch(output.parent) if indexed else None
+    if previous:
+        previous = previous / "input"
     for file in files:
         if check_cancelled:
             check_cancelled()

@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .pageproof import LABELS
+from .progress import STAGE_NAMES, fraction, overall
 
 
 MODELS = {
@@ -128,9 +129,82 @@ def traffic_panel(requests, limit, now, frame):
                  height=limit + 2)
 
 
-def log_panel(entries, rows):
+def progress_bar(value, size=10):
+    filled = int(value * size)
+    line = Text("━" * filled, style="bright_cyan", no_wrap=True, overflow="ellipsis")
+    line.append("─" * (size - filled), style="grey50")
+    line.append(f" {int(value * 100):3}%", style="bold")
+    return line
+
+
+def progress_page_size(height, stage_count):
+    return max(1, height - stage_count - 7)
+
+
+def progress_view(batch, page, height, width):
+    if not batch:
+        return Text("等待批次 · G 返回", style="cyan")
+    stages = batch["stages"]
+    heading = Text("批次总进度  ", no_wrap=True)
+    heading.append_text(progress_bar(overall(stages), 16))
+    heading.append("   G 返回   [ 上页   ] 下页")
+    lines = [heading]
+    for name, stage in stages.items():
+        line = Text(f"{STAGE_NAMES[name]:7} ", no_wrap=True, overflow="ellipsis")
+        if stage["planned"]:
+            line.append_text(progress_bar(fraction(stage)))
+            unit = "页" if name in ("render", "paddle") else "区域"
+            line.append(f"  {stage['processed']}/{stage['total']} {unit}")
+            if stage["errors"]:
+                line.append(f"  错误 {stage['errors']}", style="red")
+            if stage["current"] and not stage["finished"]:
+                line.append("  " + stage["current"])
+        else:
+            line.append("等待", style="dim")
+        lines.append(line)
+    docs = list(stages["render"]["docs"])
+    size = progress_page_size(height, len(stages))
+    pages = max(1, (len(docs) + size - 1) // size)
+    page = min(page, pages - 1)
+    table = Table(box=box.SIMPLE, expand=True, padding=(0, 1), show_edge=False)
+    table.add_column("文件", ratio=2, no_wrap=True, overflow="ellipsis")
+    table.add_column("总进度", width=15 if width >= 85 else 5, justify="right")
+    for name in stages:
+        table.add_column(STAGE_NAMES[name], justify="right", no_wrap=True)
+    for doc in docs[page * size:(page + 1) * size]:
+        cells = []
+        for stage in stages.values():
+            done, total, errors = stage["docs"].get(doc, (0, 0, 0))
+            cells.append(Text(f"{done}/{total}" if stage["planned"] else "—", style="red" if errors else ""))
+        ratio = overall(stages, doc)
+        doc_bar = progress_bar(ratio) if width >= 85 else Text(f"{int(ratio * 100)}%")
+        table.add_row(Text(doc), doc_bar, *cells)
+    lines.extend([Text(f"文件明细 · {page + 1}/{pages} 页 · 共 {len(docs)} 个文件", style="bold"), table])
+    return Group(*lines)
+
+
+def log_panel(entries, rows, batch=None):
     lines = []
-    for entry in entries[-rows:]:
+    if batch and rows >= 2:
+        stages = batch["stages"]
+        total = Text("总进度 ", style="bold", no_wrap=True, overflow="ellipsis")
+        total.append_text(progress_bar(overall(stages)))
+        total.append("  G 明细", style="dim")
+        lines.append(total)
+        doc = batch["current_doc"]
+        if doc and rows >= 3:
+            line = Text("文件   ", no_wrap=True, overflow="ellipsis")
+            line.append_text(progress_bar(overall(stages, doc), 6))
+            line.append("  " + doc)
+            lines.append(line)
+        if rows >= 4:
+            active = []
+            for name, stage in stages.items():
+                if stage["current"] and not stage["finished"]:
+                    active.append(f"{STAGE_NAMES[name]} {stage['processed']}/{stage['total']}")
+            if active:
+                lines.append(Text(" · ".join(active), style="cyan", no_wrap=True, overflow="ellipsis"))
+    for entry in entries[-(rows - len(lines)):]:
         stamp = datetime.fromtimestamp(entry["time"]).strftime("%H:%M:%S")
         line = Text(f"{stamp}  ", style="dim", no_wrap=True, overflow="ellipsis")
         message = "".join(char if char.isprintable() else " " for char in entry["message"])
@@ -142,24 +216,52 @@ def log_panel(entries, rows):
                  height=rows + 2)
 
 
-def model_log_panel(alias, entries, rows):
+def model_log_panel(source, streams, rows):
+    names = {alias: MODELS[alias][0] if alias in MODELS else alias for alias in streams}
+    title = "vLLM 日志"
+    if source == "auto":
+        title += " · 自动"
+    engines = [name for alias, name in names.items() if alias != "auto"]
+    if engines:
+        title += " · " + " / ".join(engines)
+
+    streams = {alias: entries for alias, entries in streams.items() if entries}
+    # Split space between engines, giving unused rows to busier streams.
+    available = max(0, rows)
+    counts = {}
+    for index, alias in enumerate(sorted(streams, key=lambda alias: len(streams[alias]))):
+        remaining = len(streams) - index
+        count = min(len(streams[alias]), (available + remaining - 1) // remaining)
+        counts[alias] = count
+        available -= count
     lines = []
-    for entry in entries[-rows:]:
-        plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", entry)
-        plain = "".join(char if char.isprintable() else " " for char in plain)
-        lines.append(Text(plain, no_wrap=True, overflow="ellipsis"))
+    for alias, entries in streams.items():
+        if not counts[alias]:
+            continue
+        for entry in entries[-counts[alias]:]:
+            plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", entry)
+            plain = "".join(char if char.isprintable() else " " for char in plain)
+            line = Text(no_wrap=True, overflow="ellipsis")
+            if len(names) > 1:
+                line.append(f"{names[alias]} │ ", style="cyan")
+            line.append(plain)
+            lines.append(line)
     if not lines:
         lines.append(Text("等待 vLLM 输出", style="dim", no_wrap=True, overflow="ellipsis"))
-    return Panel(Group(*lines), title=f"vLLM 日志 · {alias}", title_align="left", border_style="cyan",
+    return Panel(Group(*lines), title=title, title_align="left", border_style="cyan",
                  box=box.ROUNDED, height=rows + 2)
 
 
-def console_view(snap, selected, message, expanded, width, height, now, frame, model_log=None):
+def console_view(snap, selected, message, expanded, width, height, now, frame, model_log=None, progress_page=None,
+                 log_source="auto"):
+    batch = snap.get("batch_progress")
+    if progress_page is not None:
+        return progress_view(batch, progress_page, height, width)
     requests = snap.get("requests", [])
     logs = snap.get("logs", [])
     if height <= 5:
         rows = max(1, height - 2)
-        return log_panel(logs, rows) if model_log is None else model_log_panel(selected, model_log, rows)
+        return log_panel(logs, rows, batch) if model_log is None else model_log_panel(log_source, model_log, rows)
     layout = snap.get("layout")
     layout_runtime = snap.get("layout_runtime", {})
     capture = snap.get("capture_progress")
@@ -184,7 +286,7 @@ def console_view(snap, selected, message, expanded, width, height, now, frame, m
     header.append(f"   {snap['mode']}   127.0.0.1:{snap['port']}", style="bold")
     header.append(f"   {len(active)} 项任务", style="cyan")
     controls = Text(no_wrap=True, overflow="ellipsis")
-    for key, action in (("1–4", "选卡"), ("C", "并发"), ("S", "启动"), ("X", "停止"), ("A", "全停"), ("T", "↻ 重启"),
+    for key, action in (("G", "进度"), ("1–4", "选卡"), ("0", "日志自动"), ("C", "并发"), ("S", "启动"), ("X", "停止"), ("A", "全停"), ("T", "↻ 重启"),
                         ("R", "运行"), ("L", "vLLM"), ("P", "POST"), ("^C", "退出")):
         controls.append(f" {key} ", style="bold black on bright_cyan" if key == "T" else "bold cyan")
         controls.append(action + " ")
@@ -210,7 +312,8 @@ def console_view(snap, selected, message, expanded, width, height, now, frame, m
             visible.append(layout_card(layout, layout_runtime, 3, skipped))
             remaining -= 3
     visible.append(controls)
-    if capture and remaining >= 5 and not expanded:
+    paddle_finished = bool(batch and batch["stages"]["paddle"]["finished"])
+    if capture and not paddle_finished and remaining >= 5 and not expanded:
         total, reused, done = capture["total"], capture["reused"], capture["done"]
         detail = f"Paddle · 复用 {reused} 页 · 新完成 {done} 页 · 剩余 {total - reused - done} 页"
         if capture.get("layout_page") and capture.get("ocr_page"):
@@ -252,17 +355,17 @@ def console_view(snap, selected, message, expanded, width, height, now, frame, m
     footer = message or snap["models"][selected]["detail"] or snap.get("config_path") or snap["input_path"]
     visible.append(Text(footer, style="yellow" if message else "dim", no_wrap=True, overflow="ellipsis"))
     if model_log is None:
-        visible.append(log_panel(logs, log_height - 2))
+        visible.append(log_panel(logs, log_height - 2, batch))
     elif width >= 100:
         log_grid = Table.grid(expand=True, padding=(0, 1))
         log_grid.add_column(ratio=1)
         log_grid.add_column(ratio=1)
-        log_grid.add_row(log_panel(logs, log_height - 2), model_log_panel(selected, model_log, log_height - 2))
+        log_grid.add_row(log_panel(logs, log_height - 2, batch), model_log_panel(log_source, model_log, log_height - 2))
         visible.append(log_grid)
     elif log_height >= 6:
         model_height = log_height // 2
-        visible.extend([log_panel(logs, log_height - model_height - 2),
-                        model_log_panel(selected, model_log, model_height - 2)])
+        visible.extend([log_panel(logs, log_height - model_height - 2, batch),
+                        model_log_panel(log_source, model_log, model_height - 2)])
     else:
-        visible.append(model_log_panel(selected, model_log, log_height - 2))
+        visible.append(model_log_panel(log_source, model_log, log_height - 2))
     return Group(*visible)

@@ -40,9 +40,28 @@ def write_rows(path, rows):
             stream.write(json_text(row) + "\n")
 
 
+def previous_batch(batch):
+    marker = batch / ".previous-batch"
+    if marker.is_file():
+        name = marker.read_text(encoding="utf-8").strip()
+        if name and name != ".." and Path(name).name == name:
+            candidate = batch.parent / name
+            if candidate.is_dir() and not candidate.is_symlink() and candidate != batch:
+                return candidate
+    return None
+
+
 class Cache:
     def __init__(self, path):
+        path = Path(path)
         self.path = path
+        self.previous = None
+        if path.parent.name == "production":
+            batch = previous_batch(path.parent.parent)
+            if batch is not None:
+                source = batch / "production" / path.name
+                if source.is_file():
+                    self.previous = source.resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(path)) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("CREATE TABLE IF NOT EXISTS calls (key TEXT PRIMARY KEY, response TEXT)")
@@ -50,6 +69,12 @@ class Cache:
     def get(self, key):
         with closing(sqlite3.connect(self.path)) as db:
             row = db.execute("SELECT response FROM calls WHERE key = ?", (key,)).fetchone()
+            if row is None and self.previous:
+                with closing(sqlite3.connect(self.previous, uri=True)) as prior:
+                    row = prior.execute("SELECT response FROM calls WHERE key = ?", (key,)).fetchone()
+                if row:
+                    with db:
+                        db.execute("INSERT OR IGNORE INTO calls VALUES (?, ?)", (key, row[0]))
         return json.loads(row[0]) if row else None
 
     def put(self, key, value):

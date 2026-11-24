@@ -148,7 +148,7 @@ class Miner:
             labels = list(dict.fromkeys(row["label"] for row in inputs.values()
                                         if "label" in row and row["label"] not in existing))
             if labels:
-                existing.update(zip(labels, self.services[judge].score(task, image, labels), strict=True))
+                existing.update(zip(labels, self.services[judge].score(task, image, labels, region=case), strict=True))
             for row in inputs.values():
                 if "label" in row:
                     row["judge"] = existing[row["label"]]
@@ -193,23 +193,39 @@ def eligible_regions(config, manifest):
             yield row
 
 
-def warm(config, manifest, output, alias, check_cancelled=None):
+def warm(config, manifest, output, alias, check_cancelled=None, resume=None, report_work=None, region_totals=None):
     policy = config["mining"]
     if alias not in [policy["target"], *policy["teachers"]]:
         raise ValueError(f"{alias} is not a configured OCR reader")
     output.mkdir(parents=True, exist_ok=True)
-    service = Service(config["models"][alias], Cache(output / "cache.sqlite"))
+    service = Service(config["models"][alias], Cache(output / "cache.sqlite"), resume=resume)
 
     def read(row):
         if check_cancelled:
             check_cancelled()
+        if report_work:
+            report_work(alias, row["doc_id"], started=True)
         image = (manifest.parent / row["image"]).read_bytes()
         if row.get("image_sha256") not in (None, digest(image)):
             raise ValueError(f"image changed after capture: {row['image']}")
-        return service.read(row["task"], image)["status"]
+        status = service.read(row["task"], image, region=row)["status"]
+        if report_work:
+            report_work(alias, row["doc_id"], failed=status == "service_error")
+        return status
 
-    rows = (row for row in eligible_regions(config, manifest) if row["task"] in service.config["tasks"]
-            and not (alias == policy["target"] and "target" in row))
+    def work_items():
+        final = policy.get("judge") or "mine"
+        for row in eligible_regions(config, manifest):
+            if region_totals is not None:
+                if check_cancelled:
+                    check_cancelled()
+                for name, totals in region_totals.items():
+                    if name == final or row["task"] in config["models"][name]["tasks"]:
+                        totals[row["doc_id"]] += 1
+            if row["task"] in service.config["tasks"] and not (alias == policy["target"] and "target" in row):
+                yield row
+
+    rows = work_items()
     workers = max(policy["workers"], service.config.get("max_sequences", 0))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         counts = Counter()
@@ -218,10 +234,12 @@ def warm(config, manifest, output, alias, check_cancelled=None):
     return dict(counts)
 
 
-def mine(config, manifest, output, cached_readers=False, check_cancelled=None):
+def mine(config, manifest, output, cached_readers=False, check_cancelled=None, resume=None, report_work=None):
     output.mkdir(parents=True, exist_ok=True)
     policy = config["mining"]
     miner = Miner(config, Cache(output / "cache.sqlite"), manifest.parent)
+    if judge := policy.get("judge"):
+        miner.services[judge].resume = resume
     if cached_readers:
         for alias in [policy["target"], *policy["teachers"]]:
             miner.services[alias].cache_only = True
@@ -229,7 +247,15 @@ def mine(config, manifest, output, cached_readers=False, check_cancelled=None):
     def score_region(row, initial=None):
         if check_cancelled:
             check_cancelled()
-        return miner.run(row, initial)
+        if report_work and initial is None:
+            report_work(policy.get("judge") or "mine", row["doc_id"], started=True)
+        result = miner.run(row, initial)
+        if report_work and initial is None:
+            failed = any(model.get("judge", {}).get("status") in
+                         {"service_error", "forward_error", "render_error", "encode_error"}
+                         for model in result["models"].values())
+            report_work(policy.get("judge") or "mine", row["doc_id"], failed=failed)
+        return result
 
     rows = []
     workers = policy["workers"]
