@@ -125,7 +125,7 @@ def apply_model_selection(config, policy):
                         "judge": judge if judge and enabled(judge) else None}
 
 
-def run_local(config, output, jobs, pages=None, stage="all", session=None):
+def run_local(config, output, jobs, pages=None, stage="all", session=None, progress=None):
     output.mkdir(parents=True, exist_ok=True)
     policy = config["mining"]
     target = policy["target"]
@@ -133,7 +133,8 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None):
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")
 
     def use_model(alias):
-        print(f"Starting {alias}. Log: {output / (alias + '.log')}", flush=True)
+        if progress is None:
+            print(f"Starting {alias}. Log: {output / (alias + '.log')}", flush=True)
         return session(alias, output) if session else model_session(config, alias, output)
 
     for alias in [target, *policy["teachers"]]:
@@ -141,10 +142,14 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None):
             continue
         with use_model(alias):
             if alias == target and pages:
-                capture_pages(config, pages.resolve(), output / "capture")
+                capture_pages(config, pages.resolve(), output / "capture", progress=progress)
             for manifest, run in jobs:
                 counts = warm(config, manifest, run, alias)
-                print(f"{alias} {run.name} {json_text(counts)}", flush=True)
+                if progress:
+                    progress(f"{alias} 转录完成 · {sum(counts.values())} 个区域 · "
+                             f"{counts.get('service_error', 0)} 个服务错误")
+                else:
+                    print(f"{alias} {run.name} {json_text(counts)}", flush=True)
                 if counts.get("service_error"):
                     raise RuntimeError(f"{alias} returned service errors for {run.name}; see {output}")
     judge = policy.get("judge")
@@ -152,7 +157,10 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None):
         with (use_model(judge) if judge else nullcontext()):
             for manifest, run in jobs:
                 summary = mine(config, manifest, run, cached_readers=True)
-                print(f"{run.name} {json_text(summary)}", flush=True)
+                if progress:
+                    progress(f"筛选完成 · 扫描 {summary['scanned']} 个区域 · {summary['review']} 个待复核")
+                else:
+                    print(f"{run.name} {json_text(summary)}", flush=True)
 
 
 def local_config(settings, base):

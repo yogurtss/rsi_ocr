@@ -105,8 +105,9 @@ def main(argv=None):
             if not defaults.exists():
                 import sysconfig
                 defaults = Path(sysconfig.get_path("data")) / "share/pageproof/default.yaml"
-            manager = Manager(settings, defaults, port, args.config.resolve())
             interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.headless
+            manager = Manager(settings, defaults, port, args.config.resolve(),
+                              log_sink=None if interactive else lambda message: print(message, flush=True))
             uvicorn.run(manager_app(manager, (lambda m: dashboard(m.snapshot, m.enqueue, m.closing.is_set)) if interactive else None), host="127.0.0.1",
                         port=port, log_level="warning" if interactive else "info", access_log=False)
         elif args.command == "monitor":

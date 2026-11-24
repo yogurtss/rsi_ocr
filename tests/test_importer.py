@@ -23,7 +23,14 @@ class InputFolderTest(unittest.TestCase):
                 page.save(root / "sample.PDF", save_all=True, append_images=[page], resolution=72)
             settings = {"extensions": [".pdf", ".jpeg"], "recursive": True, "dpi": 144,
                         "output_root": root / "results"}
-            rows = list(read_rows(render_pages(root, output, settings)))
+            progress = []
+            rows = list(read_rows(render_pages(root, output, settings, progress=progress.append)))
+            self.assertEqual(progress, [
+                "导入文件 1/2 · nested/sample.JPEG",
+                "导入文件 2/2 · sample.PDF",
+                "PDF · 第 1/2 页 · 文件 2/2 · sample.PDF",
+                "PDF · 第 2/2 页 · 文件 2/2 · sample.PDF",
+            ])
             self.assertEqual([(r["doc_id"], r["page_id"]) for r in rows],
                              [("nested/sample.JPEG", 1), ("sample.PDF", 1), ("sample.PDF", 2)])
             self.assertEqual((output / rows[0]["image"]).read_bytes(), picture.read_bytes())

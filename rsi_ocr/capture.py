@@ -120,7 +120,9 @@ class Recorder:
                 thread.join()
 
 
-def capture_pages(config, manifest, root):
+def capture_pages(config, manifest, root, progress=None):
+    from collections import Counter
+
     from paddleocr import PaddleOCRVL
 
     root.mkdir(parents=True, exist_ok=True)
@@ -134,12 +136,22 @@ def capture_pages(config, manifest, root):
                                  target["tasks"], "layout-bbox-v1"]).encode())
 
     def rows():
+        if progress:
+            page_counts = Counter(page["doc_id"] for page in read_rows(manifest))
+            file_numbers = {doc_id: index for index, doc_id in enumerate(page_counts, 1)}
+            pages_seen = Counter()
+            progress("初始化 PaddleOCR 版面识别")
         with recorder.listen() as url:
             pipeline = PaddleOCRVL(
                 **options.get("pipeline", {}), vl_rec_backend="vllm-server", vl_rec_server_url=url,
                 vl_rec_api_model_name=target["model"], vl_rec_api_key="capture-local",
             )
             for page in read_rows(manifest):
+                if progress:
+                    doc_id = page["doc_id"]
+                    pages_seen[doc_id] += 1
+                    progress(f"识别 · 第 {pages_seen[doc_id]}/{page_counts[doc_id]} 页 · "
+                             f"文件 {file_numbers[doc_id]}/{len(file_numbers)} · {doc_id}")
                 image = (manifest.parent / page["image"]).resolve()
                 if image.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
                     raise ValueError(f"capture requires a single page as PNG or JPEG: {image}")

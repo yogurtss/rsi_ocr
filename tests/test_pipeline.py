@@ -80,8 +80,10 @@ class PipelineTest(unittest.TestCase):
         with (patch.dict("sys.modules", {"paddleocr": module}), patch.object(Recorder, "listen", local_transport),
               patch.object(Service, "request", return_value=chat("raw OCR")) as upstream):
             path = capture_pages(self.config, pages, self.root / "capture")
-            capture_pages(self.config, pages, self.root / "capture")
+            progress = []
+            capture_pages(self.config, pages, self.root / "capture", progress=progress.append)
             upstream.assert_called_once()
+        self.assertEqual(progress, ["初始化 PaddleOCR 版面识别", "识别 · 第 1/1 页 · 文件 1/1 · d"])
         row, = read_rows(path)
         self.assertEqual((path.parent / row["image"]).read_bytes(), PNG)
         self.assertEqual(row["target"]["raw"], "raw OCR")

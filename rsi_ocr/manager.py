@@ -1,4 +1,5 @@
 """Local model service ownership and inference queue for PageProof."""
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
 from copy import deepcopy
@@ -7,6 +8,7 @@ from pathlib import Path
 from queue import Queue
 from tempfile import TemporaryDirectory
 from threading import Event, RLock, Thread
+from time import time
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -24,7 +26,7 @@ from .store import atomic_output
 
 
 class Manager:
-    def __init__(self, settings, base, port, config_path=None):
+    def __init__(self, settings, base, port, config_path=None, log_sink=None):
         self.settings = settings
         self.config_path = config_path
         self.mode = settings.get("deployment", {}).get("mode", "on_demand")
@@ -43,6 +45,8 @@ class Manager:
         self.journal_dir = None
         self.journal_path = None
         self.lock = RLock()
+        self.logs = deque(maxlen=128)
+        self.log_sink = log_sink
         self.closing = Event()
         self.queue = Queue()
         self.jobs = {}
@@ -111,7 +115,8 @@ class Manager:
         with self.lock:
             active = [j for j in self.jobs.values() if j["status"] in {"running", "queued"}]
             finished = [j for j in self.jobs.values() if j["status"] not in {"running", "queued"}]
-            return {"requests": requests, "config_path": str(self.config_path or ""),
+            return {"requests": requests, "logs": [entry.copy() for entry in self.logs],
+                    "config_path": str(self.config_path or ""),
                     "service": "pageproof", "mode": self.mode, "port": self.port, "studio_port": self.settings["port"],
                     "output_root": str(self.root), "input_path": str(self.default_input),
                     "models": {k: v.copy() for k, v in self.models.items()},
@@ -139,9 +144,22 @@ class Manager:
             self.queue.put(job)
         return job["id"]
 
-    def update(self, row, **values):
+    def log(self, message, *, error=False):
         with self.lock:
-            row.update(values)
+            self.logs.append({"time": time(), "message": message, "error": error})
+        if self.log_sink:
+            self.log_sink(message)
+
+    def update_job(self, job, **values):
+        with self.lock:
+            job.update(values)
+            status = values.get("status")
+            if status == "failed":
+                self.log(f"任务失败 · {job['detail']}", error=True)
+            elif status == "running":
+                self.log(f"任务开始 · {job['action']} · {job['value']}")
+            elif "stage" in values:
+                self.log("任务 · " + job["stage"])
 
     def set_mode(self, mode):
         if mode not in {"on_demand", "managed"}:
@@ -222,11 +240,14 @@ class Manager:
             if session is None:
                 return
             self.models[alias]["status"] = "stopping"
+            self.log(f"正在卸载模型 · {alias}")
         session[0].close()
         if self.journal_path:
             record(self.journal_path, "UPDATE requests SET status=0 WHERE status IS NULL AND source IN (?,?)",
                    (alias, alias + "/engine"))
-        self.update(self.models[alias], status="offline", detail="")
+        with self.lock:
+            self.models[alias].update(status="offline", detail="")
+            self.log(f"模型已卸载 · {alias}")
 
     def unload_all(self):
         for alias in list(self.sessions):
@@ -241,21 +262,27 @@ class Manager:
         if not self.models[alias]["enabled"]:
             raise ValueError(f"{alias} 已在模型设置中关闭")
         if self.is_ready(alias):
+            self.log(f"模型已就绪 · 复用 {alias}")
             return
         if self.mode == "on_demand":
             self.unload_all()
         else:
             self.unload(alias)
-        self.update(self.models[alias], status="starting", detail=str(output / (alias + ".log")))
+        with self.lock:
+            self.models[alias].update(status="starting", detail=str(output / (alias + ".log")))
+            self.log(f"正在加载模型 · {alias} · GPU {self.models[alias]['gpu']}")
         stack = ExitStack()
         try:
             processes = stack.enter_context(model_session(self.config, alias, output, self.closing.is_set))
         except Exception as error:
-            self.update(self.models[alias], status="failed", detail=str(error))
+            with self.lock:
+                self.models[alias].update(status="failed", detail=str(error))
+                self.log(f"模型加载失败 · {alias} · {error}", error=True)
             raise
         with self.lock:
             self.sessions[alias] = (stack, processes)
             self.models[alias]["status"] = "healthy"
+            self.log(f"模型已就绪 · {alias}")
 
     def monitor_health(self):
         while not self.closing.wait(2):
@@ -275,8 +302,8 @@ class Manager:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         output = self.root / stamp
         output.mkdir(parents=True)
-        self.update(job, output=str(output), stage="导入页面")
-        pages = render_pages(Path(job["value"]), output / "input", self.settings)
+        self.update_job(job, output=str(output), stage="导入页面")
+        pages = render_pages(Path(job["value"]), output / "input", self.settings, progress=self.log)
         config = deepcopy(self.config)
         resolve_config(config, self.base.parent)
 
@@ -284,10 +311,10 @@ class Manager:
         def use_model(alias, directory):
             if self.closing.is_set():
                 raise RuntimeError("后台正在关闭")
-            self.update(job, stage=f"加载 {alias}")
+            self.update_job(job, stage=f"加载 {alias}")
             self.load(alias, directory)
-            self.update(job, stage={"paddle": "版面与基线识别", "oxr": "OXR 转录", "ovis": "Ovis 转录",
-                                    "jev": "Jev 评分与难例筛选"}[alias])
+            self.update_job(job, stage={"paddle": "版面与基线识别", "oxr": "OXR 转录", "ovis": "Ovis 转录",
+                                        "jev": "Jev 评分与难例筛选"}[alias])
             yield
 
         jobs = [(output / "capture/regions.jsonl", output / "production")]
@@ -297,27 +324,28 @@ class Manager:
             def stage(alias):
                 if self.closing.is_set():
                     raise RuntimeError("后台正在关闭")
-                run_local(config, output, jobs, pages, stage=alias, session=lambda *_: nullcontext())
+                run_local(config, output, jobs, pages, stage=alias, session=lambda *_: nullcontext(),
+                          progress=self.log)
 
-            self.update(job, stage="版面与基线识别")
+            self.update_job(job, stage="版面与基线识别")
             stage(policy["target"])
             if policy["teachers"]:
-                self.update(job, stage="教师模型转录")
+                self.update_job(job, stage="教师模型转录")
                 with ThreadPoolExecutor(max_workers=len(policy["teachers"])) as pool:
                     list(pool.map(stage, policy["teachers"]))
-            self.update(job, stage="Jev 评分与难例筛选" if policy["judge"] else "难例筛选")
+            self.update_job(job, stage="Jev 评分与难例筛选" if policy["judge"] else "难例筛选")
             stage(policy["judge"] or "mine")
             return
         try:
             run_local(config, output, jobs, pages,
-                      session=use_model)
+                      session=use_model, progress=self.log)
         finally:
             self.unload_all()
 
     def start_models(self, aliases, directory, job):
         aliases = [alias for alias in aliases if self.models[alias]["enabled"]]
         if self.mode == "managed" and len(aliases) > 1:
-            self.update(job, stage="并行加载模型")
+            self.update_job(job, stage="并行加载模型")
             failures = []
             with ThreadPoolExecutor(max_workers=len(aliases)) as pool:
                 starts = {alias: pool.submit(self.load, alias, directory) for alias in aliases}
@@ -330,16 +358,16 @@ class Manager:
                 raise RuntimeError("；".join(failures))
             return
         for alias in aliases:
-            self.update(job, stage=f"加载 {alias}")
+            self.update_job(job, stage=f"加载 {alias}")
             self.load(alias, directory)
 
     def work(self):
         try:
             while (job := self.queue.get()) is not None:
                 if self.closing.is_set():
-                    self.update(job, status="failed", detail="后台已关闭")
+                    self.update_job(job, status="failed", detail="后台已关闭")
                     continue
-                self.update(job, status="running", stage=job["action"])
+                self.update_job(job, status="running", stage=job["action"])
                 try:
                     if job["action"] == "run":
                         self.infer(job)
@@ -353,13 +381,13 @@ class Manager:
                             self.prepare_restart(aliases)
                         self.start_models(aliases, directory, job)
                     elif job["value"] == "all":
-                        self.update(job, stage="卸载全部模型")
+                        self.update_job(job, stage="卸载全部模型")
                         self.unload_all()
                     else:
                         self.unload(job["value"])
-                    self.update(job, status="done", stage="完成")
+                    self.update_job(job, status="done", stage="完成")
                 except Exception as error:
-                    self.update(job, status="failed", detail=str(error))
+                    self.update_job(job, status="failed", detail=str(error))
         finally:
             self.unload_all()
 

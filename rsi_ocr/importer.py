@@ -9,7 +9,7 @@ from .local import apply_model_selection, local_config, run_local
 from .store import atomic_output, write_rows
 
 
-def render_pages(source, output, settings):
+def render_pages(source, output, settings, progress=None):
     import pypdfium2 as pdfium
 
     extensions = {ext.lower() for ext in settings["extensions"]}
@@ -33,9 +33,12 @@ def render_pages(source, output, settings):
         raise ValueError("dpi 必须是正整数")
 
     def pages():
-        for file in files:
+        for number, file in enumerate(files, 1):
             doc_id = file.relative_to(base).as_posix()
-            print(f"导入 {doc_id}", flush=True)
+            if progress:
+                progress(f"导入文件 {number}/{len(files)} · {doc_id}")
+            else:
+                print(f"导入 {doc_id}", flush=True)
             if file.suffix.lower() != ".pdf":
                 from PIL import Image
 
@@ -48,7 +51,11 @@ def render_pages(source, output, settings):
                 continue
             try:
                 with pdfium.PdfDocument(file) as doc:
-                    for index in range(len(doc)):
+                    page_count = len(doc)
+                    for index in range(page_count):
+                        if progress:
+                            progress(f"PDF · 第 {index + 1}/{page_count} 页 · "
+                                     f"文件 {number}/{len(files)} · {doc_id}")
                         page = doc[index]
                         image = Path("pages") / doc_id / f"{index + 1}.png"
                         try:

@@ -56,7 +56,12 @@ class ManagerTests(unittest.TestCase):
                     time.sleep(.01)
                 self.assertEqual(manager.jobs[last]["status"], "done")
                 self.assertEqual(events, [("start", "paddle"), ("stop", "paddle"), ("start", "oxr"), ("stop", "oxr")])
-                self.assertEqual(manager.snapshot()["models"]["oxr"]["status"], "offline")
+                snapshot = manager.snapshot()
+                self.assertEqual(snapshot["models"]["oxr"]["status"], "offline")
+                logs = [entry["message"] for entry in snapshot["logs"]]
+                self.assertLess(logs.index("正在加载模型 · paddle · GPU 0"), logs.index("模型已就绪 · paddle"))
+                self.assertIn("模型已就绪 · 复用 paddle", logs)
+                self.assertIn("模型已卸载 · oxr", logs)
             finally:
                 manager.close()
 
@@ -141,8 +146,9 @@ class ManagerTests(unittest.TestCase):
         stages = []
         teachers = Barrier(2)
 
-        def run_stage(*args, stage, session):
+        def run_stage(*args, stage, session, progress):
             stages.append(stage)
+            progress(f"执行 {stage}")
             if stage in {"oxr", "ovis"}:
                 teachers.wait(timeout=2)
 
@@ -160,6 +166,7 @@ class ManagerTests(unittest.TestCase):
                 self.assertEqual(stages[0], "paddle")
                 self.assertEqual(set(stages[1:-1]), {"oxr", "ovis"})
                 self.assertEqual(stages[-1], "jev")
+                self.assertIn("执行 jev", [entry["message"] for entry in manager.snapshot()["logs"]])
                 unload.assert_not_called()
 
     def test_restart_updates_only_selected_model_from_config(self):
