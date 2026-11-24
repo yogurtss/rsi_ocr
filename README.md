@@ -1,40 +1,97 @@
 # GlyphStack
 
-本地文档识别与质量复核平台。终端后台调度三个 OCR 模型与 Jev 评分器，浏览器呈现原图、模型差异和判定依据。支持 PDF、PNG、JPEG 和递归目录。
+本地文档识别与质量复核平台。终端后台调度 PaddleOCR-VL、OXR、OvisOCR3 和 Jev，浏览器中可对照原图和识别结果、审核难例，并导出训练数据。支持 PDF、PNG、JPEG 和递归目录。
 
-## 快速开始
+[安装](#安装) · [单卡部署](#单卡部署) · [日常使用](#日常使用) · [故障排查](#故障排查) · [复核与导出](#复核与导出)
 
-从仓库根目录运行。默认启用的 Jev 需要模型权重和 MiniCPM-OCR 源码中的渲染 SDK。GPU 环境、模型权重和 Chromium 的安装步骤见[单卡环境安装](docs/advanced.md#环境与模型)。
+## 安装
+
+以下命令以 Ubuntu 24.04（Linux 或 WSL2）、NVIDIA GPU 和 Conda 为例。先用 `nvidia-smi` 确认驱动能识别 GPU。所有 GlyphStack 命令从仓库根目录执行。
+
+### 1. 创建环境
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y git build-essential python3-dev nodejs fontconfig fonts-noto-cjk
+git clone https://github.com/yogurtss/rsi_ocr.git
+cd rsi_ocr
+conda create -p "$PWD/runs/conda" -c conda-forge python=3.12 pip
 conda activate "$PWD/runs/conda"
-python -m pip install -e '.[quality]'
-git clone --depth 1 https://github.com/OpenBMB/MiniCPM-OCR.git runs/MiniCPM-OCR  # 首次部署 Jev 时执行
-glyphstack console
+python -m pip install -e '.[quality,jev]' \
+  'vllm==0.25.1' 'transformers==5.13.1' \
+  'paddlepaddle==3.3.1' 'paddleocr[doc-parser]==3.7.0' huggingface_hub
+PLAYWRIGHT_BROWSERS_PATH="$PWD/runs/playwright" python -m playwright install --with-deps chromium
 ```
 
-如果已经克隆了 MiniCPM-OCR，把 `configs/import.yaml` 里的 `deployment.minicpm_repo` 指向源码仓库根目录。该目录下应有 `scripts/minicpm-ocr-jev/sdk/app.py`。
+**Jev SDK 随 GlyphStack 源码和 Python 包一起分发。** 默认配置直接使用内置 SDK，安装时只需克隆上面的 GlyphStack 仓库。模型权重单独下载，Chromium 和字体由本节命令安装。[内置 SDK 来源和许可证](rsi_ocr/_vendor/jev/README.md)
 
-把待处理的 PDF 或图片放进 `data/inbox/`，也可以在[统一配置](configs/import.yaml)中修改 `input_path` 后重启后台。在其他已激活同一环境的终端中运行：
+### 2. 下载模型
+
+已有权重时，可在配置里指向现有目录，并安装已有 OXR 目录中的插件。首次下载使用下列命令。OXR 和 OvisOCR3 需要完整模型目录，分别包含 vLLM 插件和 OCR 提示文件。
 
 ```bash
-glyphstack run --port 8520                 # 提交配置中的输入，等待并打印批次目录
-glyphstack run /data/invoice.pdf --port 8520  # 临时指定文件或目录
-glyphstack studio --port 8520              # 启动前端，自动读取后台的结果目录和前端端口
+hf download PaddlePaddle/PaddleOCR-VL-1.6 --local-dir runs/model-cache/paddleocr-vl-16
+hf download PaddlePaddle/PP-DocLayoutV3 --local-dir runs/model-cache/PP-DocLayoutV3
+hf download SoMarkAI/OXR-1.0 --local-dir runs/model-cache/OXR-1.0
+hf download ATH-MaaS/OvisOCR3 --local-dir runs/model-cache/OvisOCR3
+hf download openbmb/MiniCPM-OCR-Jev --local-dir runs/model-cache/MiniCPM-OCR-Jev
+python -m pip install ./runs/model-cache/OXR-1.0/plugins/vllm
+python -m pip check
 ```
 
-在[GlyphStack 复核平台](http://127.0.0.1:8517)点 **导入结果**，选择已完成的批次。上方「模型后台」可查看服务状态和当前任务。
+## 单卡部署
 
-## 部署自检
-
-仓库附带两个合成输入：[文字图片](examples/inputs/inspection.png)含批号和小数，[单页 PDF](examples/inputs/measurements.pdf)含一张 13 行 × 10 列的表格。
+首次部署时复制配置，并创建默认输入目录。
 
 ```bash
-rsi-ocr run examples/inputs --import-only  # 无需 GPU，检查图片导入与 PDF 渲染
-glyphstack run examples/inputs --port 8520  # 后台启动后，提交同一组文件做完整推理
+mkdir -p runs data/inbox
+cp configs/import.yaml runs/server.yaml
 ```
 
-导入后，批次的 `input/pages.jsonl` 应有两条记录。完整推理结束后，在复核平台导入该批次，核对图片中的 `12.50 mm` 和 PDF 首行数据 `GS-001 / 12.20`。在难例复核首页的「显示模型」中切换单模型和多模型，检查表格宽度。可直接横向和纵向滚动表格，多模型对照时会同步滚动。桌面端可拖动左侧队列边界或点击箭头收起队列。勾选「只看差异格」，即可按行列坐标并排核对各模型的值、缺失和合并情况。
+编辑 `runs/server.yaml` 中现有的 `deployment.model_root`。使用上述下载命令时将其设为 `runs/model-cache`，已有权重时填写实际根目录。各模型的 `path` 可使用相对于根目录的目录名或绝对路径。保持 `deployment.mode: on_demand` 即可在单卡上依次加载模型。已有显存上限时，在 `deployment.gpu_memory` 填写预算，例如 `0.60`。
+
+**终端 1** 启动后台。模型在处理任务时按阶段加载，空闲时可以显示离线。
+
+```bash
+glyphstack console --config runs/server.yaml
+```
+
+**终端 2** 激活相同的环境并跑样例。可先执行第一行，只验证 PDF 和图片导入。第二行会提交完整推理并在完成后打印批次目录。第三行启动浏览器复核工作台。
+
+```bash
+rsi-ocr run examples/inputs --settings runs/server.yaml --import-only
+glyphstack run examples/inputs --port 8520
+glyphstack studio --port 8520
+```
+
+导入自检应在打印出的 `input/pages.jsonl` 中生成两条记录。完整推理完成后，打开 [复核工作台](http://127.0.0.1:8517)，点 **导入结果** 选择该批次，在批次概览中查看处理结果。样例包含一张[文字图片](examples/inputs/inspection.png)和一份[单页表格 PDF](examples/inputs/measurements.pdf)，可核对图片上的 `12.50 mm` 和表格首行的 `GS-001 / 12.20`。
+
+后台和工作台默认监听服务器的本地回环地址。若在本机浏览器访问远程服务器，从本机建立 SSH 转发，再打开同一工作台地址。
+
+```bash
+ssh -N -L 8517:127.0.0.1:8517 user@server
+```
+
+## 日常使用
+
+```bash
+glyphstack run --port 8520                    # 处理配置中的 input_path，默认为 data/inbox
+glyphstack run /data/invoice.pdf --port 8520  # 处理指定文件或整个目录
+glyphstack status --port 8520                 # 查看模型和任务状态
+```
+
+同一个未完成批次可用相同输入路径再次提交。Console 的 **R** 会提交配置中的默认输入。复核时保留批次内的原页图片、裁图和结果文件。
+
+## 故障排查
+
+| 现象 | 检查方法 |
+|---|---|
+| 无法连接后台 | 确认终端 1 仍在运行，`--port` 与配置中的 `manager_port` 一致。 |
+| 提示权重缺失或模型加载失败 | 核对 `deployment.model_root`、各模型的 `path` 和 GPU 编号。用 `glyphstack status --port 8520` 查找任务的输出目录，再看其中对应模型的日志。手动启动模型的日志在 `<output_root>/.manager/`。 |
+| OXR 无法注册或 Ovis 缺提示文件 | 确认已安装 `OXR-1.0/plugins/vllm`，并确认 Ovis 权重目录中存在 `prompts/plain_ocr.txt`。 |
+| Jev 找不到 `sdk/app.py` | 新版默认从安装包加载 SDK。确认 Console 使用的是新版，再检查自用 YAML 中的 `deployment.minicpm_repo`。配置中删掉该覆盖项即可使用内置 SDK。 |
+| Jev 引擎启动后渲染仍失败 | 看 `jev-render.log`，检查 Node.js、Chromium 的安装路径、系统库和 CJK 字体。 |
+| CUDA 显存不足 | 保持串行按需模式，核对卡上其他进程、`gpu_memory` 和模型的 `max_sequences`。 |
 
 ## 模型控制台
 
@@ -78,7 +135,7 @@ glyphstack stop all --port 8520            # 命令行卸载全部模型
 | 参数 | 用途 |
 |---|---|
 | `manager_port`、`port` | 终端后台端口与前端端口，默认分别为 8520、8517。 |
-| `deployment` | 运行方式、权重根目录 `model_root`、Jev 源码目录 `minicpm_repo`、版面检测权重和默认 GPU 设置。 |
+| `deployment` | 运行方式、权重根目录 `model_root`、可选的 Jev 外部源码目录 `minicpm_repo`、版面检测权重和默认 GPU 设置。 |
 | `deployment.models` | 各模型的启用状态 `enabled`、权重目录 `path`、GPU、服务端口和上下文长度，以及 Jev 渲染端口。 |
 | `input_path`、`output_root` | 默认输入文件或目录、结果批次根目录。复核时保留批次内的图片和裁图。 |
 | `extensions`、`recursive`、`dpi` | 输入类型、递归开关、PDF 渲染分辨率。 |
@@ -110,7 +167,7 @@ glyphstack stop all --port 8520            # 命令行卸载全部模型
 ## 复核与导出
 
 - **看原图**。点击裁图或原页，滚轮缩放、拖动平移。原页框标出当前区域，可手动补框。
-- **选结果**。三个模型的转录同时展示，可切换差异基准，无需人工参考标注。表格支持按行列坐标跳转，分块查看合并单元格，并逐处对照缺失、内容和结构差异。展开「判定明细与计算过程」可查看实测值、阈值和排序分。
+- **选结果**。三个模型的转录同时展示，可切换差异基准，无需人工参考标注。在「显示模型」中选择要对照的模型，表格会同步滚动。可按行列坐标跳转，勾选「只看差异格」查看缺失、内容和结构差异。展开「判定明细与计算过程」可查看实测值、阈值和排序分。桌面端可拖动左侧队列边界或点击箭头收起队列。
 - **做决定**。选择模型后点 **Pass** 保存其转录，**Not pass** 驳回。筛选「非难例」可批量通过当前筛选下尚未审核的有效 Paddle 结果，支持撤销。
 - **导出**。审核决定写入 `production/review.sqlite`。顶部「导出」生成带 UTC 时间戳的 SFT JSONL，保存在 `production/sft_exports/`。图片路径指向批次裁图，表格答案采用 OTSL。[PaddleOCR‑VL 官方数据格式](https://github.com/PaddlePaddle/ERNIE/blob/release/v1.5/docs/paddleocr_vl_sft_zh.md)
 

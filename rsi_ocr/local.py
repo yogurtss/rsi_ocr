@@ -10,7 +10,7 @@ from pathlib import Path
 from rsi_ocr.capture import capture_pages
 from rsi_ocr.config import load_config
 from rsi_ocr.mining import mine, warm
-from rsi_ocr.service import Service, ServiceError, command
+from rsi_ocr.service import Service, ServiceError, command, jev_runtime_dir
 from rsi_ocr.store import json_text
 
 
@@ -88,6 +88,10 @@ def model_session(config, alias, output, cancelled=lambda: False):
     from urllib.parse import urlsplit
 
     spec = config["models"][alias]
+    if spec["kind"] == "jev":
+        _, _, render_dir = command(config, alias, "render")
+        if render_dir is None or not (render_dir / "sdk/app.py").is_file():
+            raise FileNotFoundError(f"找不到 Jev SDK 的 sdk/app.py：{render_dir}，请检查 deployment.minicpm_repo")
     probes = endpoints(spec)
     with ExitStack() as stack:
         processes = []
@@ -173,8 +177,8 @@ def local_config(settings, base):
     config = load_config(base)
     deployment = settings.get("deployment", {})
     root = deployment.get("model_root", settings.get("model_root", "/mnt/g/models"))
-    minicpm = deployment.get("minicpm_repo", settings.get("minicpm_repo", "runs/MiniCPM-OCR"))
-    configure_models(config, Path(root).expanduser().resolve(), Path(minicpm).expanduser(), deployment)
+    minicpm = deployment.get("minicpm_repo", settings.get("minicpm_repo"))
+    configure_models(config, Path(root).expanduser().resolve(), minicpm, deployment)
     config["mining"].update(settings["mining"])
     return config
 
@@ -188,7 +192,7 @@ def set_concurrency(spec, sequences):
     spec.update(max_sequences=sequences, concurrency=sequences)
 
 
-def configure_models(config, root, minicpm, deployment=None):
+def configure_models(config, root, minicpm=None, deployment=None):
     deployment = deployment or {}
     models = config["models"]
     models["paddle"]["revision"] = "PaddleOCR-VL-1.6-local"
@@ -261,7 +265,7 @@ def configure_models(config, root, minicpm, deployment=None):
         set_concurrency(models[alias], sequences)
         models[alias]["timeout"] = 300
 
-    jev_dir = minicpm.resolve() / "scripts/minicpm-ocr-jev"
+    jev_dir = jev_runtime_dir(minicpm)
     sidecar = models["jev"]["sidecars"]["render"]
     render_port = deployment.get("models", {}).get("jev", {}).get("render_port", 18500)
     sidecar["argv"][-2:] = [str(render_port), models["jev"]["engine_url"]]

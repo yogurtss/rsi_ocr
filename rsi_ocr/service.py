@@ -120,12 +120,27 @@ def chat_result(response):
     return {"status": status, "raw": content, "finish_reason": finish, "usage": response.get("usage")}
 
 
+def jev_runtime_dir(repository=None):
+    bundled = Path(__file__).resolve().parent / "_vendor" / "jev"
+    if not repository:
+        return bundled
+    repository = Path(repository).expanduser()
+    external = repository.resolve() / "scripts" / "minicpm-ocr-jev"
+    if repository == Path("runs/MiniCPM-OCR") and not (external / "sdk/app.py").is_file():
+        return bundled
+    return external
+
+
 def command(config, alias, service_name=None):
     spec = config["models"][alias]
     service = spec["launch"] if service_name is None else spec["sidecars"][service_name]
     env = {**os.environ, **{key: expand(val) for key, val in service.get("env", {}).items()}}
     args = [expand(arg) for arg in service["argv"]]
-    cwd = Path(expand(service["cwd"])) if "cwd" in service else None
+    cwd = service.get("cwd")
+    if cwd == "${MINICPM_OCR_REPO}/scripts/minicpm-ocr-jev":
+        cwd = jev_runtime_dir(os.environ.get("MINICPM_OCR_REPO"))
+    elif cwd is not None:
+        cwd = Path(expand(cwd))
     return args, env, cwd
 
 

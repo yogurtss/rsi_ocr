@@ -27,7 +27,7 @@ rsi-ocr --config configs/local.yaml serve paddle
 OXR_REPO=/srv/OXR OXR_WEIGHTS=/models/OXR-1.0 rsi-ocr --config configs/local.yaml serve oxr
 rsi-ocr --config configs/local.yaml serve ovis
 JEV_WEIGHTS=/models/MiniCPM-OCR-Jev rsi-ocr --config configs/local.yaml serve jev
-MINICPM_OCR_REPO=/srv/MiniCPM-OCR rsi-ocr --config configs/local.yaml serve jev --sidecar render
+rsi-ocr --config configs/local.yaml serve jev --sidecar render
 rsi-ocr --config configs/local.yaml probe
 ```
 
@@ -109,21 +109,14 @@ rsi-ocr --config configs/local.yaml train grpo --data runs/round01/data \
 
 ### 环境与模型
 
-准备 `paddleocr-vl-16`、`OXR-1.0`（含 `plugins/vllm`）、`OvisOCR3`、`MiniCPM-OCR-Jev` 和 `PP-DocLayoutV3` 五个本地目录。模型文件可从官方仓库取得。[OXR-1.0](https://huggingface.co/SoMarkAI/OXR-1.0) · [PP-DocLayoutV3](https://huggingface.co/PaddlePaddle/PP-DocLayoutV3)
+先完成主 README 的环境安装和模型下载。以下命令为分阶段评测生成配置，`--models` 指向模型根目录。[安装步骤](../README.md#安装)
 
 ```bash
-conda create -p "$PWD/runs/conda" -c conda-forge python=3.12 pip
 conda activate "$PWD/runs/conda"
-python -m pip install -e '.[quality]' 'vllm==0.25.1' 'transformers==5.13.1' \
-  'paddlepaddle==3.3.1' 'paddleocr[doc-parser]==3.7.0' 'Pillow==12.3.0' \
-  'playwright==1.62.0' 'Markdown==3.10.3' /mnt/g/models/OXR-1.0/plugins/vllm
-python -m pip check
-git clone --depth 1 https://github.com/OpenBMB/MiniCPM-OCR.git runs/MiniCPM-OCR
-PLAYWRIGHT_BROWSERS_PATH="$PWD/runs/playwright" python -m playwright install chromium
-python scripts/configure_local.py
+python scripts/configure_local.py --models runs/model-cache
 ```
 
-Jev 的 Chromium 需要 Linux 共享库和 CJK 字体。可使用系统已安装依赖，也可将 Noto CJK 字体放入 `runs/fonts/` 并创建 `runs/font-cache/`。Ubuntu 24.04 上缺少 `libnspr4.so`、`libnss3.so` 或 `libasound.so.2` 时，可将 `libnspr4`、`libnss3`、`libasound2t64` 的系统包解包到 `runs/chromium-libs/` 后生成配置，供渲染服务加载。生成器会保留已有 `configs/local.yaml`，需要重新生成时可以用 `--out` 指定另一个文件。
+Jev 的文本预检需要 PATH 上的 Node.js，Chromium 需要 Linux 共享库和 CJK 字体。可使用系统已安装依赖，也可将 Noto CJK 字体放入 `runs/fonts/` 并创建 `runs/font-cache/`。Ubuntu 24.04 上缺少 `libnspr4.so`、`libnss3.so` 或 `libasound.so.2` 时，可将 `libnspr4`、`libnss3`、`libasound2t64` 的系统包解包到 `runs/chromium-libs/` 后生成配置，供渲染服务加载。生成器默认使用内置 SDK，可用 `--minicpm /srv/MiniCPM-OCR` 指定外部源码仓库。生成器会保留已有 `configs/local.yaml`，需要重新生成时可以用 `--out` 指定另一个文件。
 
 ### 基准评测
 

@@ -22,6 +22,30 @@ class ManagerTests(unittest.TestCase):
             time.sleep(.01)
         self.fail(f"Job did not finish: {job}")
 
+    def test_jev_uses_bundled_sdk_and_accepts_external_checkout(self):
+        from rsi_ocr.manager import Manager
+        from rsi_ocr.service import command
+
+        settings = load_config("configs/import.yaml")
+        defaults = Path("configs/default.yaml")
+        manager = Manager(settings, defaults, 8520)
+        _, _, bundled = command(manager.config, "jev", "render")
+        self.assertTrue((bundled / "sdk/app.py").is_file())
+        self.assertTrue((bundled / "renderer/assets/katex-0.16.47/katex.min.js").is_file())
+
+        with patch.dict("os.environ", {"JEV_WEIGHTS": "/weights", "MINICPM_OCR_REPO": ""}):
+            _, _, legacy = command(load_config(defaults), "jev", "render")
+        self.assertEqual(legacy, bundled)
+
+        with TemporaryDirectory() as directory:
+            external = Path(directory) / "scripts/minicpm-ocr-jev"
+            (external / "sdk").mkdir(parents=True)
+            (external / "sdk/app.py").touch()
+            settings["deployment"]["minicpm_repo"] = directory
+            manager = Manager(settings, defaults, 8520)
+            _, _, configured = command(manager.config, "jev", "render")
+            self.assertEqual(configured, external)
+
     def test_queue_reuses_healthy_model_and_releases_owned_processes(self):
         from rsi_ocr.manager import Manager
 

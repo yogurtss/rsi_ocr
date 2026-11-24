@@ -6,7 +6,7 @@ from pathlib import Path
 
 cli = argparse.ArgumentParser()
 cli.add_argument("--models", type=Path, default=Path("/mnt/g/models"))
-cli.add_argument("--minicpm", type=Path, default=Path("runs/MiniCPM-OCR"))
+cli.add_argument("--minicpm", type=Path, help="optional external MiniCPM-OCR repository")
 cli.add_argument("--out", type=Path, default=Path("configs/local.yaml"))
 args = cli.parse_args()
 config = json.loads(Path("configs/default.yaml").read_text())

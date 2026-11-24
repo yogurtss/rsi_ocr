@@ -30,7 +30,7 @@ input_path: data/inbox
 deployment:
   mode: on_demand               # on_demand 逐个加载、串行推理；managed 后台并行启动并常驻
   model_root: /mnt/g/models    # Windows 的 G:\models；也可指向 runs/model-cache
-  minicpm_repo: runs/MiniCPM-OCR  # Jev 官方渲染服务的源码目录
+  # minicpm_repo: /srv/MiniCPM-OCR  # 可选，覆盖内置 Jev SDK 的外部源码仓库
   gpu: "0"                     # 模型省略 gpu 时使用此设备
   gpu_memory: 0.65             # 每个 vLLM 服务的显存占用比例
   max_sequences: 6             # 每个模型同时处理的最大序列数
