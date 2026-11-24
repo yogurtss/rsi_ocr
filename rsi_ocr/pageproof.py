@@ -51,6 +51,7 @@ def dashboard(snapshot, enqueue, closing=lambda: False):
     console = Console()
     expanded = False
     last_message = ""
+    concurrency_input = None
     try:
         tty.setcbreak(fd)
         with Live(console=console, screen=True, auto_refresh=False, redirect_stdout=True) as live:
@@ -59,18 +60,42 @@ def dashboard(snapshot, enqueue, closing=lambda: False):
                     snap = snapshot()
                     last_refresh = time.monotonic()
                 frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 7) % 10]
-                live.update(console_view(snap, selected, last_message, expanded, console.width, console.height,
+                message = last_message
+                if concurrency_input is not None:
+                    limit = snap["models"][selected].get("max_sequences", "—")
+                    message = f"{selected} 并发 {limit} → {concurrency_input or '_'}   Enter 提交 · Esc 取消"
+                live.update(console_view(snap, selected, message, expanded, console.width, console.height,
                                          time.time(), frame), refresh=True)
                 if select.select([fd], [], [], 0.18)[0]:
                     key = os.read(fd, 1).decode(errors="ignore").lower()
-                    if key in ("1", "2", "3", "4"):
+                    if key == "\x1b" and select.select([fd], [], [], 0.02)[0]:
+                        os.read(fd, 32)
+                        continue
+                    if concurrency_input is not None:
+                        if key in ("\r", "\n") and concurrency_input:
+                            try:
+                                job_id = enqueue("concurrency", selected, max_sequences=int(concurrency_input))
+                                last_message = "已提交并发设置 " + job_id[:8]
+                            except ValueError as error:
+                                last_message = str(error)
+                            concurrency_input = None
+                        elif key == "\x1b":
+                            concurrency_input = None
+                        elif key in ("\x08", "\x7f"):
+                            concurrency_input = concurrency_input[:-1]
+                        elif key.isascii() and key.isdigit():
+                            concurrency_input += key
+                    elif key in ("1", "2", "3", "4"):
                         selected = aliases[int(key) - 1]
+                    elif key == "c":
+                        concurrency_input = ""
                     elif key == "p":
                         expanded = not expanded
-                    elif key in ("s", "x", "t", "r"):
-                        action = {"s": "start", "x": "stop", "t": "restart", "r": "run"}[key]
+                    elif key in ("s", "x", "a", "t", "r"):
+                        action = {"s": "start", "x": "stop", "a": "stop", "t": "restart", "r": "run"}[key]
+                        value = {"r": None, "a": "all"}.get(key, selected)
                         try:
-                            job_id = enqueue(action, None if key == "r" else selected)
+                            job_id = enqueue(action, value)
                             last_message = "已提交 " + job_id[:8]
                         except ValueError as error:
                             last_message = str(error)
@@ -108,13 +133,15 @@ def main(argv=None):
             interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.headless
             manager = Manager(settings, defaults, port, args.config.resolve(),
                               log_sink=None if interactive else lambda message: print(message, flush=True))
-            uvicorn.run(manager_app(manager, (lambda m: dashboard(m.snapshot, m.enqueue, m.closing.is_set)) if interactive else None), host="127.0.0.1",
+            uvicorn.run(manager_app(manager, (lambda m: dashboard(m.snapshot, m.enqueue, m.closed.is_set)) if interactive else None), host="127.0.0.1",
                         port=port, log_level="warning" if interactive else "info", access_log=False)
         elif args.command == "monitor":
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 raise ValueError("交互面板需要终端；可用 glyphstack status 查看状态")
             dashboard(lambda: endpoint(args.port, "/status"),
-                      lambda action, value: endpoint(args.port, "/jobs", {"action": action, "value": value})["id"])
+                      lambda action, value, **options: endpoint(
+                          args.port, "/jobs", {"action": action, "value": value, **options}
+                      )["id"])
         elif args.command in {"studio", "status"}:
             snap = endpoint(args.port, "/status")
             if snap.get("service") != "pageproof":

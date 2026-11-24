@@ -3,7 +3,6 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
 from copy import deepcopy
-from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
 from tempfile import TemporaryDirectory
@@ -15,13 +14,16 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, StrictBool
+from pydantic import BaseModel, StrictBool, StrictInt
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .traffic import RequestMeter, open_journal, recent, record
+from .traffic import RequestMeter, model_load, open_journal, recent, record
 from .config import load_config, resolve_config
-from .importer import render_pages
-from .local import apply_model_selection, check_checkpoint, endpoints, healthy, local_config, mining_models, model_session, run_local
+from .importer import render_pages, resume_batch
+from .local import (
+    apply_model_selection, check_checkpoint, endpoints, healthy, local_config, mining_models,
+    model_session, run_local, set_concurrency,
+)
 from .store import atomic_output
 
 
@@ -48,6 +50,7 @@ class Manager:
         self.logs = deque(maxlen=128)
         self.log_sink = log_sink
         self.closing = Event()
+        self.closed = Event()
         self.queue = Queue()
         self.jobs = {}
         self.sessions = {}
@@ -57,7 +60,8 @@ class Manager:
     @staticmethod
     def card(spec):
         return {"model": spec["model"], "display_name": spec.get("display_name"), "url": spec["base_url"], "gpu": spec["gpu"],
-                "gpu_memory": spec["gpu_memory"], "path": spec["local_weights"], "enabled": spec["enabled"],
+                "gpu_memory": spec["gpu_memory"], "max_sequences": spec["max_sequences"], "load": {},
+                "path": spec["local_weights"], "enabled": spec["enabled"],
                 "configured_path": spec["configured_path"], "configured_gpu": spec["configured_gpu"],
                 "status": "offline" if spec["enabled"] else "disabled"}
 
@@ -104,15 +108,31 @@ class Manager:
     def close(self):
         with self.lock:
             self.closing.set()
+            self.log("后台正在关闭 · 正在卸载模型并中止任务")
             self.queue.put(None)
-        self.worker.join()
-        self.monitor.join()
-        self.journal_path = None
-        self.journal_dir.cleanup()
+        try:
+            self.unload_all()
+        finally:
+            self.worker.join()
+            self.monitor.join()
+            with self.lock:
+                self.journal_path = None
+            try:
+                self.journal_dir.cleanup()
+            finally:
+                self.closed.set()
+
+    def check_closing(self):
+        if self.closing.is_set():
+            raise RuntimeError("后台正在关闭")
+
+    def report_progress(self, message):
+        self.check_closing()
+        self.log(message)
 
     def snapshot(self):
-        requests = recent(self.journal_path)
         with self.lock:
+            requests = recent(self.journal_path)
             active = [j for j in self.jobs.values() if j["status"] in {"running", "queued"}]
             finished = [j for j in self.jobs.values() if j["status"] not in {"running", "queued"}]
             return {"requests": requests, "logs": [entry.copy() for entry in self.logs],
@@ -122,7 +142,9 @@ class Manager:
                     "models": {k: v.copy() for k, v in self.models.items()},
                     "jobs": [v.copy() for v in finished[-25:] + active]}
 
-    def enqueue(self, action, value):
+    def enqueue(self, action, value, max_sequences=None):
+        if max_sequences is not None and action != "concurrency":
+            raise ValueError("只有并发设置操作接受 max_sequences")
         if action == "run":
             value = str(Path(value or self.default_input).resolve())
             source = Path(value)
@@ -130,9 +152,16 @@ class Manager:
                 raise ValueError(f"输入路径不存在：{source}")
             if source.is_relative_to(self.root):
                 raise ValueError("请将输入文件与结果目录分开")
+        elif action == "concurrency":
+            if value not in self.models:
+                raise ValueError("请选择一个模型调整并发")
+            if type(max_sequences) is not int or max_sequences < 1:
+                raise ValueError("并发须为正整数")
         elif (value not in self.models and value != "all") or action not in {"start", "stop", "restart"}:
             raise ValueError("未知模型或操作")
         job = {"id": uuid4().hex, "action": action, "value": value, "status": "queued", "stage": "等待", "detail": ""}
+        if action == "concurrency":
+            job.update(max_sequences=max_sequences, stage=f"等待设置为 {max_sequences}")
         with self.lock:
             if self.closing.is_set():
                 raise ValueError("后台正在关闭")
@@ -185,6 +214,27 @@ class Manager:
         with atomic_output(self.config_path) as tmp:
             yaml.dump(settings, tmp)
             tmp.chmod(self.config_path.stat().st_mode)
+
+    def update_concurrency(self, alias, sequences):
+        with self.lock:
+            self.check_closing()
+            spec = self.config["models"][alias]
+            if spec["max_sequences"] == sequences:
+                return
+            if self.config_path:
+                yaml, settings = self.read_settings()
+                models = settings.setdefault("deployment", {}).setdefault("models", {})
+                models.setdefault(alias, {})["max_sequences"] = sequences
+                self.write_settings(yaml, settings)
+            restart = alias in self.sessions
+            set_concurrency(spec, sequences)
+            self.models[alias]["max_sequences"] = sequences
+            self.log(f"并发已设置 · {alias} · {sequences}")
+        if restart:
+            self.unload(alias)
+            directory = self.root / ".manager"
+            directory.mkdir(parents=True, exist_ok=True)
+            self.load(alias, directory)
 
     def validate_settings_change(self):
         if self.closing.is_set():
@@ -239,7 +289,7 @@ class Manager:
             session = self.sessions.pop(alias, None)
             if session is None:
                 return
-            self.models[alias]["status"] = "stopping"
+            self.models[alias].update(status="stopping", load={})
             self.log(f"正在卸载模型 · {alias}")
         session[0].close()
         if self.journal_path:
@@ -250,8 +300,13 @@ class Manager:
             self.log(f"模型已卸载 · {alias}")
 
     def unload_all(self):
-        for alias in list(self.sessions):
-            self.unload(alias)
+        with self.lock:
+            aliases = list(self.sessions)
+        if len(aliases) > 1:
+            with ThreadPoolExecutor(max_workers=len(aliases)) as pool:
+                list(pool.map(self.unload, aliases))
+        elif aliases:
+            self.unload(aliases[0])
 
     def is_ready(self, alias):
         session = self.sessions.get(alias)
@@ -259,6 +314,7 @@ class Manager:
             healthy(s, path) for s, path in endpoints(self.config["models"][alias]))
 
     def load(self, alias, output):
+        self.check_closing()
         if not self.models[alias]["enabled"]:
             raise ValueError(f"{alias} 已在模型设置中关闭")
         if self.is_ready(alias):
@@ -269,48 +325,59 @@ class Manager:
         else:
             self.unload(alias)
         with self.lock:
+            self.check_closing()
             self.models[alias].update(status="starting", detail=str(output / (alias + ".log")))
             self.log(f"正在加载模型 · {alias} · GPU {self.models[alias]['gpu']}")
-        stack = ExitStack()
         try:
-            processes = stack.enter_context(model_session(self.config, alias, output, self.closing.is_set))
+            with ExitStack() as stack:
+                processes = stack.enter_context(model_session(self.config, alias, output, self.closing.is_set))
+                with self.lock:
+                    self.check_closing()
+                    self.sessions[alias] = (stack.pop_all(), processes)
+                    self.models[alias]["status"] = "healthy"
+                    self.log(f"模型已就绪 · {alias}")
         except Exception as error:
             with self.lock:
                 self.models[alias].update(status="failed", detail=str(error))
                 self.log(f"模型加载失败 · {alias} · {error}", error=True)
             raise
-        with self.lock:
-            self.sessions[alias] = (stack, processes)
-            self.models[alias]["status"] = "healthy"
-            self.log(f"模型已就绪 · {alias}")
 
     def monitor_health(self):
         while not self.closing.wait(2):
             with self.lock:
                 sessions = list(self.sessions.items())
             for alias, session in sessions:
+                if self.closing.is_set():
+                    return
                 ok = self.is_ready(alias)
+                spec = self.config["models"][alias]
+                load = model_load(spec.get("engine_url") or spec["base_url"]) if ok else {}
                 with self.lock:
                     if self.sessions.get(alias) is session:
-                        self.models[alias]["status"] = "healthy" if ok else "unhealthy"
+                        self.models[alias].update(status="healthy" if ok else "unhealthy", load=load)
 
     def infer(self, job):
         if self.mode == "managed":
             missing = [alias for alias in mining_models(self.config["mining"]) if not self.is_ready(alias)]
             if missing:
                 raise ValueError("模型未就绪，详情见工作台或 glyphstack status：" + ", ".join(missing))
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        output = self.root / stamp
-        output.mkdir(parents=True)
-        self.update_job(job, output=str(output), stage="导入页面")
-        pages = render_pages(Path(job["value"]), output / "input", self.settings, progress=self.log)
+        source = Path(job["value"])
+        self.update_job(job, stage="检查输入与续跑进度")
+        with resume_batch(self.root, source, self.settings, self.check_closing) as (output, resumed, signatures):
+            if resumed:
+                self.log(f"续跑批次 · {output}")
+            self.update_job(job, output=str(output), stage="导入页面")
+            pages = render_pages(source, output / "input", self.settings, progress=self.report_progress,
+                                 reuse_existing=resumed, signatures=signatures)
+            self.infer_pages(job, output, pages)
+
+    def infer_pages(self, job, output, pages):
         config = deepcopy(self.config)
         resolve_config(config, self.base.parent)
 
         @contextmanager
         def use_model(alias, directory):
-            if self.closing.is_set():
-                raise RuntimeError("后台正在关闭")
+            self.check_closing()
             self.update_job(job, stage=f"加载 {alias}")
             self.load(alias, directory)
             self.update_job(job, stage={"paddle": "版面与基线识别", "oxr": "OXR 转录", "ovis": "Ovis 转录",
@@ -322,10 +389,8 @@ class Manager:
             policy = config["mining"]
 
             def stage(alias):
-                if self.closing.is_set():
-                    raise RuntimeError("后台正在关闭")
                 run_local(config, output, jobs, pages, stage=alias, session=lambda *_: nullcontext(),
-                          progress=self.log)
+                          progress=self.report_progress, check_cancelled=self.check_closing)
 
             self.update_job(job, stage="版面与基线识别")
             stage(policy["target"])
@@ -338,7 +403,7 @@ class Manager:
             return
         try:
             run_local(config, output, jobs, pages,
-                      session=use_model, progress=self.log)
+                      session=use_model, progress=self.report_progress, check_cancelled=self.check_closing)
         finally:
             self.unload_all()
 
@@ -371,6 +436,9 @@ class Manager:
                 try:
                     if job["action"] == "run":
                         self.infer(job)
+                    elif job["action"] == "concurrency":
+                        self.update_job(job, stage=f"设置 {job['value']} 并发为 {job['max_sequences']}")
+                        self.update_concurrency(job["value"], job["max_sequences"])
                     elif job["action"] in {"start", "restart"}:
                         directory = self.root / ".manager"
                         directory.mkdir(parents=True, exist_ok=True)
@@ -395,6 +463,7 @@ class Manager:
 class Command(BaseModel):
     action: str
     value: str | None = None
+    max_sequences: StrictInt | None = None
 
 
 class ModelSettings(BaseModel):
@@ -463,7 +532,7 @@ def manager_app(manager, terminal=None):
     @app.post("/jobs", status_code=202)
     def submit(command: Command):
         try:
-            return {"id": manager.enqueue(command.action, command.value)}
+            return {"id": manager.enqueue(command.action, command.value, command.max_sequences)}
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
 

@@ -83,7 +83,7 @@ class PipelineTest(unittest.TestCase):
             progress = []
             capture_pages(self.config, pages, self.root / "capture", progress=progress.append)
             upstream.assert_called_once()
-        self.assertEqual(progress, ["初始化 PaddleOCR 版面识别", "识别 · 第 1/1 页 · 文件 1/1 · d"])
+        self.assertEqual(progress, ["初始化 PaddleOCR 版面识别", "复用 OCR · 第 1/1 页 · 文件 1/1 · d"])
         row, = read_rows(path)
         self.assertEqual((path.parent / row["image"]).read_bytes(), PNG)
         self.assertEqual(row["target"]["raw"], "raw OCR")

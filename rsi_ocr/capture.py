@@ -147,16 +147,18 @@ def capture_pages(config, manifest, root, progress=None):
                 vl_rec_api_model_name=target["model"], vl_rec_api_key="capture-local",
             )
             for page in read_rows(manifest):
-                if progress:
-                    doc_id = page["doc_id"]
-                    pages_seen[doc_id] += 1
-                    progress(f"识别 · 第 {pages_seen[doc_id]}/{page_counts[doc_id]} 页 · "
-                             f"文件 {file_numbers[doc_id]}/{len(file_numbers)} · {doc_id}")
                 image = (manifest.parent / page["image"]).resolve()
                 if image.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
                     raise ValueError(f"capture requires a single page as PNG or JPEG: {image}")
                 shard = root / "capture_cache" / (capture_key(page, image) + ".jsonl")
-                if shard.exists():
+                cached = shard.exists()
+                if progress:
+                    doc_id = page["doc_id"]
+                    pages_seen[doc_id] += 1
+                    label = "复用 OCR" if cached else "识别"
+                    progress(f"{label} · 第 {pages_seen[doc_id]}/{page_counts[doc_id]} 页 · "
+                             f"文件 {file_numbers[doc_id]}/{len(file_numbers)} · {doc_id}")
+                if cached:
                     yield from read_rows(shard)
                     continue
                 recorder.page = {

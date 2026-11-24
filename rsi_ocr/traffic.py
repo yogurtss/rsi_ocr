@@ -1,11 +1,42 @@
-"""Observe POST metadata at the ASGI boundary of each managed service."""
+"""Observe request traffic and vLLM engine load for managed services."""
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from contextlib import closing
+from http.client import HTTPException
+from math import isfinite
+from urllib.parse import urlsplit
+from urllib.request import urlopen
 from uuid import uuid4
+
+
+def model_load(base_url):
+    url = urlsplit(base_url)._replace(path="/metrics", query="", fragment="").geturl()
+    try:
+        with urlopen(url, timeout=1) as response:
+            metrics = response.read().decode("utf-8", errors="replace")
+    except (OSError, HTTPException):
+        return {}
+
+    values = {}
+    names = ("num_requests_running", "num_requests_waiting", "kv_cache_usage_perc", "gpu_cache_usage_perc")
+    pattern = rf"^vllm:({'|'.join(names)})(?:\{{.*\}})?[ \t]+(\S+)"
+    for name, value in re.findall(pattern, metrics, re.MULTILINE):
+        try:
+            number = float(value)
+        except ValueError:
+            continue
+        if isfinite(number) and number >= 0:
+            values.setdefault(name, []).append(number)
+    load = {key: sum(int(number) for number in values[f"num_requests_{key}"])
+            for key in ("running", "waiting") if f"num_requests_{key}" in values}
+    cache = values.get("kv_cache_usage_perc", values.get("gpu_cache_usage_perc", []))
+    if cache and max(cache) <= 1:
+        load["kv_usage"] = max(cache)
+    return load
 
 
 def open_journal(path):

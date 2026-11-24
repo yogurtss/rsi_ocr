@@ -146,7 +146,7 @@ class ManagerTests(unittest.TestCase):
         stages = []
         teachers = Barrier(2)
 
-        def run_stage(*args, stage, session, progress):
+        def run_stage(*args, stage, session, progress, check_cancelled):
             stages.append(stage)
             progress(f"执行 {stage}")
             if stage in {"oxr", "ovis"}:
@@ -156,18 +156,61 @@ class ManagerTests(unittest.TestCase):
             settings = load_config("configs/import.yaml")
             settings["output_root"] = directory
             settings["deployment"]["mode"] = "managed"
+            source = Path(directory) / "scan.pdf"
+            source.touch()
             manager = Manager(settings, Path("configs/default.yaml"), 8520)
             with patch.object(manager, "is_ready", return_value=True), patch(
                 "rsi_ocr.manager.render_pages", return_value=Path("pages.jsonl")
             ), patch("rsi_ocr.manager.resolve_config"), patch("rsi_ocr.manager.run_local", side_effect=run_stage), patch.object(
                 manager, "unload_all"
             ) as unload:
-                manager.infer({"value": directory})
+                manager.infer({"value": str(source)})
                 self.assertEqual(stages[0], "paddle")
                 self.assertEqual(set(stages[1:-1]), {"oxr", "ovis"})
                 self.assertEqual(stages[-1], "jev")
                 self.assertIn("执行 jev", [entry["message"] for entry in manager.snapshot()["logs"]])
                 unload.assert_not_called()
+
+    def test_shutdown_unloads_model_before_waiting_for_active_job(self):
+        from rsi_ocr.manager import Manager
+
+        active = Event()
+        released = Event()
+
+        @contextmanager
+        def session(*args):
+            try:
+                yield [Mock(poll=lambda: None)]
+            finally:
+                released.set()
+
+        def infer(job):
+            active.set()
+            if not released.wait(timeout=2):
+                raise RuntimeError("推理仍在等待模型")
+            manager.check_closing()
+
+        with TemporaryDirectory() as directory, patch("rsi_ocr.manager.model_session", session):
+            settings = load_config("configs/import.yaml")
+            settings["output_root"] = str(Path(directory) / "output")
+            manager = Manager(settings, Path("configs/default.yaml"), 8520)
+            with patch.object(manager, "infer", side_effect=infer):
+                manager.start()
+                try:
+                    start_id = manager.enqueue("start", "paddle")
+                    self.assertEqual(self.wait_for_job(manager, start_id)["status"], "done")
+                    active_id = manager.enqueue("run", directory)
+                    self.assertTrue(active.wait(timeout=2))
+                    queued_id = manager.enqueue("run", directory)
+                finally:
+                    manager.close()
+
+            snapshot = manager.snapshot()
+            jobs = {job["id"]: job for job in snapshot["jobs"]}
+            self.assertEqual(jobs[active_id]["detail"], "后台正在关闭")
+            self.assertEqual(jobs[queued_id]["detail"], "后台已关闭")
+            self.assertEqual(snapshot["models"]["paddle"]["status"], "offline")
+            self.assertTrue(manager.closed.is_set())
 
     def test_restart_updates_only_selected_model_from_config(self):
         from rsi_ocr.manager import Manager
@@ -183,6 +226,54 @@ class ManagerTests(unittest.TestCase):
             unload.assert_called_once_with("ovis")
             self.assertEqual(manager.models["ovis"]["display_name"], "Ovis Lab")
             self.assertEqual(manager.models["ovis"]["url"], "http://127.0.0.1:18102/v1")
+
+    def test_concurrency_change_waits_for_current_job_and_restarts_selected_model(self):
+        from rsi_ocr.manager import Manager
+
+        active, release = Event(), Event()
+        launches = []
+
+        @contextmanager
+        def session(config, alias, output, cancelled):
+            spec = config["models"][alias]
+            argv = spec["launch"]["argv"]
+            launches.append((alias, spec["concurrency"], argv[argv.index("--max-num-seqs") + 1]))
+            yield [Mock(poll=lambda: None)]
+
+        def infer(job):
+            active.set()
+            if not release.wait(timeout=3):
+                raise TimeoutError("Test batch did not finish")
+
+        with TemporaryDirectory() as directory, patch("rsi_ocr.manager.model_session", session):
+            root = Path(directory)
+            path = root / "settings.yaml"
+            path.write_text(Path("configs/import.yaml").read_text())
+            settings = load_config(path)
+            settings["output_root"] = str(root / "out")
+            base = Path("configs/default.yaml")
+            manager = Manager(settings, base, 8520, path)
+            with patch.object(manager, "infer", side_effect=infer):
+                manager.start()
+                try:
+                    start = manager.enqueue("start", "paddle")
+                    self.assertEqual(self.wait_for_job(manager, start)["status"], "done")
+                    manager.enqueue("run", directory)
+                    self.assertTrue(active.wait(timeout=2))
+                    with self.assertRaisesRegex(ValueError, "正整数"):
+                        manager.enqueue("concurrency", "paddle", 0)
+                    change = manager.enqueue("concurrency", "paddle", 8)
+                    self.assertEqual(manager.jobs[change]["status"], "queued")
+                    self.assertEqual(manager.snapshot()["models"]["paddle"]["max_sequences"], 6)
+                    release.set()
+                    self.assertEqual(self.wait_for_job(manager, change)["status"], "done")
+                    self.assertEqual(manager.snapshot()["models"]["paddle"]["max_sequences"], 8)
+                    self.assertEqual(manager.snapshot()["models"]["oxr"]["max_sequences"], 6)
+                finally:
+                    release.set()
+                    manager.close()
+            self.assertEqual(launches, [("paddle", 6, "6"), ("paddle", 8, "8")])
+            self.assertEqual(Manager(load_config(path), base, 8520).models["paddle"]["max_sequences"], 8)
 
     def test_model_settings_round_trip_and_unload_changed_service(self):
         from rsi_ocr.manager import Manager, ModelSettings
@@ -232,10 +323,12 @@ class ManagerTests(unittest.TestCase):
             settings["deployment"]["mode"] = "managed"
             for alias in ("oxr", "ovis", "jev"):
                 settings["deployment"]["models"][alias]["enabled"] = False
+            source = Path(directory) / "scan.pdf"
+            source.touch()
             manager = Manager(settings, Path("configs/default.yaml"), 8520)
             with patch.object(manager, "is_ready", return_value=True) as ready, patch(
                 "rsi_ocr.manager.render_pages", return_value=Path("pages.jsonl")
             ), patch("rsi_ocr.manager.run_local") as run:
-                manager.infer({"value": directory})
+                manager.infer({"value": str(source)})
             ready.assert_called_once_with("paddle")
             self.assertEqual([call.kwargs["stage"] for call in run.call_args_list], ["paddle", "mine"])

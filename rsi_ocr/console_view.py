@@ -31,24 +31,35 @@ def model_card(alias, index, spec, selected, requests, frame, now, spacious):
     label, status_color = LABELS[spec["status"]]
     state = Text(f"{frame if spec['status'] in {'starting', 'stopping'} else '●'} {label}",
                  style=status_color, no_wrap=True, overflow="ellipsis")
-    state.append(f"  {role}", style="dim")
     address = urlsplit(spec["url"])
+    state.append(f"  {role} :{address.port}", style="dim")
     hardware = Text(f"GPU {spec['gpu']}  ·  上限 {spec['gpu_memory']:.0%}", no_wrap=True, overflow="ellipsis")
     current = [r for r in requests if r["source"].split("/")[0] == alias]
-    activity = Text(f":{address.port}", style=accent, no_wrap=True, overflow="ellipsis")
-    if current:
-        pending = sum(r["status"] is None for r in current)
-        activity.append(f"  {frame} POST ×{pending}" if pending else f"  POST {elapsed(current[0]['elapsed_ms'])}")
+    load = spec.get("load", {})
+    limit = spec.get("max_sequences", "—")
+    running = load.get("running", "—")
+    waiting = load.get("waiting", "—")
+    if running != "—" or waiting != "—":
+        activity = f"运行 {running}/{limit}  等 {waiting}"
+    elif spec["status"] == "healthy":
+        source = alias + "/engine" if alias == "jev" else alias
+        pending = sum(r["status"] is None and r["source"] == source for r in current)
+        activity = f"POST {pending}  并发 {limit}"
+    else:
+        activity = f"并发 {limit}"
     title = Text(f"{'▸ ' if selected else ''}{index} {name}", style=f"bold {accent}")
-    lines = [state, hardware, activity]
+    lines = [state, hardware, Text(activity, style="yellow" if isinstance(waiting, int) and waiting else accent,
+                                  no_wrap=True, overflow="ellipsis")]
     if spacious:
-        bins = [0] * 12
+        kv = load.get("kv_usage")
+        bins = [0] * (8 if kv is not None else 12)
         for event in current:
-            age = int((now - event["started"]) // 5)
+            age = int((now - event["started"]) * len(bins) // 60)
             if 0 <= age < len(bins):
                 bins[-1-age] += 1
         graph = "".join("▁▂▃▄▅▆▇█"[min(7, count)] for count in bins)
-        lines.append(Text(f"{graph}  60s", style=accent if any(bins) else "dim",
+        detail = f"KV {kv:.0%}  {graph}" if kv is not None else f"{graph}  60s"
+        lines.append(Text(detail, style=accent if kv is not None or any(bins) else "dim",
                           no_wrap=True, overflow="ellipsis"))
     return Panel(Group(*lines), title=title, title_align="left",
                  border_style=accent if selected else "grey50", box=box.HEAVY if selected else box.ROUNDED,
@@ -60,12 +71,18 @@ def traffic_panel(requests, limit, now, frame):
     table.add_column(width=8)
     table.add_column(width=10)
     table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-    table.add_column(width=7, justify="right")
+    table.add_column(width=8, justify="right", no_wrap=True)
     table.add_column(width=9, justify="right")
     for row in requests[:limit]:
         code = row["status"]
-        color = "cyan" if code is None else "green" if 200 <= code < 400 else "red"
-        status = f"{frame} LIVE" if code is None else str(code or "中断")
+        if code is None:
+            status, color = f"{frame} LIVE", "cyan"
+        elif not code:
+            status, color = "中断", "red"
+        elif 200 <= code < 400:
+            status, color = f"DONE {code}", "green"
+        else:
+            status, color = f"ERR {code}", "red"
         duration = max(0, round((now - row["started"]) * 1000)) if code is None else row["elapsed_ms"]
         table.add_row(datetime.fromtimestamp(row["started"]).strftime("%H:%M:%S"), Text(row["source"]),
                       Text("POST " + row["path"]), Text(status, style=color), Text(elapsed(duration)))
@@ -110,19 +127,20 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
     header.append(f"   {snap['mode']}   127.0.0.1:{snap['port']}", style="bold")
     header.append(f"   {len(active)} 项任务", style="cyan")
     controls = Text(no_wrap=True, overflow="ellipsis")
-    for key, action in (("1–4", "选卡"), ("S", "启动"), ("X", "停止"), ("T", "↻ 重启"),
+    for key, action in (("1–4", "选卡"), ("C", "并发"), ("S", "启动"), ("X", "停止"), ("A", "全停"), ("T", "↻ 重启"),
                         ("R", "运行"), ("P", "请求视图"), ("^C", "退出")):
         controls.append(f" {key} ", style="bold black on bright_cyan" if key == "T" else "bold cyan")
         controls.append(action + " ")
     jobs = Table.grid(expand=True, padding=(0, 1))
     jobs.add_column(width=8)
-    jobs.add_column(width=9)
+    jobs.add_column(width=9, no_wrap=True, overflow="ellipsis")
     jobs.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
     jobs.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
     recent_jobs = (active + finished)[:3 if spacious else 1]
     for j in recent_jobs:
         label, color = LABELS[j["status"]]
-        jobs.add_row(Text(label, style=color), j["action"], Text(j["value"]), Text(j["detail"] or j["stage"]))
+        action = "设置并发" if j["action"] == "concurrency" else j["action"]
+        jobs.add_row(Text(label, style=color), action, Text(j["value"]), Text(j["detail"] or j["stage"]))
     if not (active or finished):
         jobs.add_row("空闲", "", Text(snap["input_path"]), "")
     visible = [header]
@@ -133,10 +151,18 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
         remaining -= card_height
     visible.append(controls)
     job_height = max(1, len(recent_jobs)) + 2
-    if not expanded and remaining >= job_height + 6:
-        visible.append(Panel(jobs, title="任务队列", title_align="left", box=box.ROUNDED))
-        remaining -= job_height
-    log_height = min(8 if spacious else 5, max(3, remaining - 3))
+    if not expanded:
+        if remaining >= job_height + 9:
+            visible.append(Panel(jobs, title="任务队列", title_align="left", box=box.ROUNDED))
+            remaining -= job_height
+        elif recent_jobs and remaining >= 9:
+            job = recent_jobs[0]
+            label, color = LABELS[job["status"]]
+            summary = f"任务 · {label} · {job['detail'] or job['stage']}"
+            visible.append(Text(summary, style=color, no_wrap=True, overflow="ellipsis"))
+            remaining -= 1
+    log_target = (8 if spacious else 5) if expanded else max(10, (remaining * 2 + 2) // 3)
+    log_height = min(log_target, max(3, remaining - 3))
     if remaining - log_height >= 3:
         visible.append(traffic_panel(requests, remaining - log_height - 2, now, frame))
     else:

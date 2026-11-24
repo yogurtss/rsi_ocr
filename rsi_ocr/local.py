@@ -92,6 +92,8 @@ def model_session(config, alias, output, cancelled=lambda: False):
     with ExitStack() as stack:
         processes = []
         for index, (endpoint, path) in enumerate(probes):
+            if cancelled():
+                raise RuntimeError(f"{alias} 启动已取消")
             address = urlsplit(endpoint["base_url"])
             with socket.socket() as sock:
                 if sock.connect_ex((address.hostname, address.port)) == 0:
@@ -125,7 +127,7 @@ def apply_model_selection(config, policy):
                         "judge": judge if judge and enabled(judge) else None}
 
 
-def run_local(config, output, jobs, pages=None, stage="all", session=None, progress=None):
+def run_local(config, output, jobs, pages=None, stage="all", session=None, progress=None, check_cancelled=None):
     output.mkdir(parents=True, exist_ok=True)
     policy = config["mining"]
     target = policy["target"]
@@ -133,6 +135,8 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")
 
     def use_model(alias):
+        if check_cancelled:
+            check_cancelled()
         if progress is None:
             print(f"Starting {alias}. Log: {output / (alias + '.log')}", flush=True)
         return session(alias, output) if session else model_session(config, alias, output)
@@ -144,7 +148,7 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
             if alias == target and pages:
                 capture_pages(config, pages.resolve(), output / "capture", progress=progress)
             for manifest, run in jobs:
-                counts = warm(config, manifest, run, alias)
+                counts = warm(config, manifest, run, alias, check_cancelled=check_cancelled)
                 if progress:
                     progress(f"{alias} 转录完成 · {sum(counts.values())} 个区域 · "
                              f"{counts.get('service_error', 0)} 个服务错误")
@@ -154,9 +158,11 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
                     raise RuntimeError(f"{alias} returned service errors for {run.name}; see {output}")
     judge = policy.get("judge")
     if stage in ("all", judge or "mine"):
+        if check_cancelled:
+            check_cancelled()
         with (use_model(judge) if judge else nullcontext()):
             for manifest, run in jobs:
-                summary = mine(config, manifest, run, cached_readers=True)
+                summary = mine(config, manifest, run, cached_readers=True, check_cancelled=check_cancelled)
                 if progress:
                     progress(f"筛选完成 · 扫描 {summary['scanned']} 个区域 · {summary['review']} 个待复核")
                 else:
@@ -171,6 +177,15 @@ def local_config(settings, base):
     configure_models(config, Path(root).expanduser().resolve(), Path(minicpm).expanduser(), deployment)
     config["mining"].update(settings["mining"])
     return config
+
+
+def set_concurrency(spec, sequences):
+    argv = spec["launch"]["argv"]
+    if "--max-num-seqs" in argv:
+        argv[argv.index("--max-num-seqs") + 1] = str(sequences)
+    else:
+        argv.extend(["--max-num-seqs", str(sequences)])
+    spec.update(max_sequences=sequences, concurrency=sequences)
 
 
 def configure_models(config, root, minicpm, deployment=None):
@@ -233,17 +248,17 @@ def configure_models(config, root, minicpm, deployment=None):
         if "gpu" in resource:
             launch["env"]["CUDA_VISIBLE_DEVICES"] = str(resource["gpu"])
         fraction = float(resource.get("gpu_memory", 0.65))
-        sequences = int(resource.get("max_sequences", 4))
+        sequences = int(resource.get("max_sequences", 6))
         parallel = int(resource.get("tensor_parallel", 1))
         if not 0 < fraction <= 1 or min(sequences, parallel, int(length)) < 1:
             raise ValueError(f"{alias} 的显存比例须在 (0,1] 内，并发、张量并行和上下文长度须为正整数")
         launch["argv"] += ["--host", "127.0.0.1", "--gpu-memory-utilization", str(fraction),
-                           "--max-num-seqs", str(sequences), "--enforce-eager", "--max-model-len", str(length),
+                           "--enforce-eager", "--max-model-len", str(length),
                            "--tensor-parallel-size", str(parallel)]
         models[alias]["gpu"] = launch["env"].get("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "auto"))
         models[alias]["gpu_memory"] = fraction
         launch["env"]["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-        models[alias]["concurrency"] = 3
+        set_concurrency(models[alias], sequences)
         models[alias]["timeout"] = 300
 
     jev_dir = minicpm.resolve() / "scripts/minicpm-ocr-jev"

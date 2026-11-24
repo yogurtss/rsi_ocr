@@ -33,7 +33,7 @@ deployment:
   minicpm_repo: runs/MiniCPM-OCR  # Jev 官方渲染服务的源码目录
   gpu: "0"                     # 模型省略 gpu 时使用此设备
   gpu_memory: 0.65             # 每个 vLLM 服务的显存占用比例
-  max_sequences: 4             # 同时处理的最大序列数
+  max_sequences: 6             # 每个模型同时处理的最大序列数
   layout_path: PP-DocLayoutV3  # 版面检测权重，相对于 model_root
   models:
     # display_name 可自定义 CLI 卡片标题。修改模型配置后按 T 重启该模型生效。

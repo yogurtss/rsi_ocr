@@ -4,13 +4,16 @@
 
 ## 快速开始
 
-从仓库根目录运行。首次准备 GPU 环境、模型和 Jev 渲染依赖，见[单卡环境安装](docs/advanced.md#环境与模型)。
+从仓库根目录运行。默认启用的 Jev 需要模型权重和 MiniCPM-OCR 源码中的渲染 SDK。GPU 环境、模型权重和 Chromium 的安装步骤见[单卡环境安装](docs/advanced.md#环境与模型)。
 
 ```bash
 conda activate "$PWD/runs/conda"
 python -m pip install -e '.[quality]'
+git clone --depth 1 https://github.com/OpenBMB/MiniCPM-OCR.git runs/MiniCPM-OCR  # 首次部署 Jev 时执行
 glyphstack console
 ```
+
+如果已经克隆了 MiniCPM-OCR，把 `configs/import.yaml` 里的 `deployment.minicpm_repo` 指向源码仓库根目录。该目录下应有 `scripts/minicpm-ocr-jev/sdk/app.py`。
 
 把待处理的 PDF 或图片放进 `data/inbox/`，也可以在[统一配置](configs/import.yaml)中修改 `input_path` 后重启后台。在其他已激活同一环境的终端中运行：
 
@@ -37,7 +40,13 @@ glyphstack run examples/inputs --port 8520  # 后台启动后，提交同一组�
 
 顶部模型卡片显示健康状态、GPU、显存上限和服务端口。较高的终端还会显示最近 60 秒的请求活动。操作栏下方显示任务队列和实时 POST。按 **1–4** 选择模型，**S** 启动、**X** 停止，**R** 提交配置中的输入。在前端 **流程与设置 → 模型部署** 选择模式并保存，也可编辑 YAML 的 `deployment.mode`。
 
-底部的运行日志自动滚动，显示带时间的模型加载结果、文件夹批次进度、PDF 渲染与 OCR 页码，以及任务完成或失败信息。`glyphstack monitor` 连接后台后也会显示这些日志。
+底部的运行日志自动滚动，显示带时间的模型加载结果、文件夹批次进度、PDF 渲染与 OCR 页码，以及任务完成或失败信息。常规视图会给日志留出更多空间，按 **P** 可以展开请求列表。`glyphstack monitor` 连接后台后也会显示这些日志。
+
+按 **A** 可提交卸载全部模型的操作。后台会先处理已提交的任务，再卸载模型，控制台保持运行。模型卡片显示离线后即可按 **Ctrl+C** 退出。也可以直接按 **Ctrl+C** 中止批次并开始释放模型，日志窗口会显示关闭进度。
+
+模型卡片的「运行 3/8　等 1」表示 vLLM 正在处理 3 个请求，上限为 8，还有 1 个请求排队。终端较高时也会显示 KV 缓存占用。服务没有返回调度指标时，卡片显示进行中的 POST 数。
+
+每个模型的默认并发上限为 6。按 **1–4** 选中模型，再按 **C**、输入新的并发上限并按 **Enter** 提交，按 **Esc** 取消输入。设置会排在已有任务之后，保存到当前 YAML，并重启已加载的选中模型。教师转录和 Jev 评分会按新上限发出请求。Paddle 的 PDF 版面识别仍逐页执行。
 
 | 模式 | 服务生命周期 |
 |---|---|
@@ -45,6 +54,8 @@ glyphstack run examples/inputs --port 8520  # 后台启动后，提交同一组�
 | `managed` 后台并行常驻 | 后台启动或保存常驻设置时自动并行加载已启用的模型。批次复用常驻服务，OXR 与 Ovis 可并行转录。 |
 
 两种模式都用 `glyphstack run <输入路径> --port 8520` 提交任务。常驻模型正在加载时，任务会排队等待。工作台顶部「模型后台」显示部署模式、就绪数量、各模型的 GPU 和启动错误。常驻模式需按可用显存分配各模型的 `gpu` 和 `gpu_memory`。
+
+任务中断后，用相同输入路径再次提交即可接着跑。按 **R** 也可以续跑配置中的默认输入。后台沿用未完成批次的时间戳目录，跳过已写入的页图，并复用有效的 OCR 和评分缓存。修改输入文件集合、文件内容或渲染 DPI，或者上次已生成 `production/summary.json`，都会新建批次。没有续跑记录的旧批次可以用 `rsi-ocr run <原输入路径> --out <旧批次目录>` 手动复用已有 OCR 缓存。
 
 ```bash
 glyphstack console --headless              # 无交互终端时运行后台
@@ -55,9 +66,10 @@ glyphstack start ovis --port 8520          # 命令行加载模型
 glyphstack restart ovis --port 8520        # 重读配置，重启指定模型
 glyphstack restart all --port 8520         # 重启当前在线的模型
 glyphstack stop ovis --port 8520           # 命令行卸载模型
+glyphstack stop all --port 8520            # 命令行卸载全部模型
 ```
 
-按 **T** 重启选中卡片的模型，按 **P** 展开或收起实时 POST 列表。请求到达时显示 LIVE，完成后显示 HTTP 状态码和耗时；直接调用托管模型端口的请求也可见。列表保留当前后台会话最近 128 条请求的元数据。Jev 的评分入口和底层引擎分别标为 `jev`、`jev/engine`。
+按 **T** 重启选中卡片的模型，按 **P** 展开或收起实时 POST 列表。进行中的请求显示 `LIVE`，成功结束时显示 `DONE` 和 HTTP 状态码，失败时显示 `ERR` 和状态码，断开时显示「中断」。列表显示耗时，并保留当前后台会话最近 128 条请求的元数据，包括直接发往托管模型端口的请求。Jev 的评分入口和底层引擎分别标为 `jev`、`jev/engine`。
 
 ## 配置
 

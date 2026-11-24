@@ -193,7 +193,7 @@ def eligible_regions(config, manifest):
             yield row
 
 
-def warm(config, manifest, output, alias):
+def warm(config, manifest, output, alias, check_cancelled=None):
     policy = config["mining"]
     if alias not in [policy["target"], *policy["teachers"]]:
         raise ValueError(f"{alias} is not a configured OCR reader")
@@ -201,6 +201,8 @@ def warm(config, manifest, output, alias):
     service = Service(config["models"][alias], Cache(output / "cache.sqlite"))
 
     def read(row):
+        if check_cancelled:
+            check_cancelled()
         image = (manifest.parent / row["image"]).read_bytes()
         if row.get("image_sha256") not in (None, digest(image)):
             raise ValueError(f"image changed after capture: {row['image']}")
@@ -208,14 +210,15 @@ def warm(config, manifest, output, alias):
 
     rows = (row for row in eligible_regions(config, manifest) if row["task"] in service.config["tasks"]
             and not (alias == policy["target"] and "target" in row))
-    with ThreadPoolExecutor(max_workers=policy["workers"]) as pool:
+    workers = max(policy["workers"], service.config.get("max_sequences", 0))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         counts = Counter()
-        while batch := list(islice(rows, policy["workers"] * 4)):
+        while batch := list(islice(rows, workers * 4)):
             counts.update(pool.map(read, batch))
     return dict(counts)
 
 
-def mine(config, manifest, output, cached_readers=False):
+def mine(config, manifest, output, cached_readers=False, check_cancelled=None):
     output.mkdir(parents=True, exist_ok=True)
     policy = config["mining"]
     miner = Miner(config, Cache(output / "cache.sqlite"), manifest.parent)
@@ -223,12 +226,19 @@ def mine(config, manifest, output, cached_readers=False):
         for alias in [policy["target"], *policy["teachers"]]:
             miner.services[alias].cache_only = True
 
+    def score_region(row, initial=None):
+        if check_cancelled:
+            check_cancelled()
+        return miner.run(row, initial)
+
     rows = []
     workers = policy["workers"]
+    if judge := policy.get("judge"):
+        workers = max(workers, miner.models.get(judge, {}).get("max_sequences", 0))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         jobs = eligible_regions(config, manifest)
         while batch := list(islice(jobs, workers * 4)):
-            rows.extend(pool.map(miner.run, batch))
+            rows.extend(pool.map(score_region, batch))
         for row in rows:
             row["audit_probability"] = policy["audit_rate"]
             key = digest(f'{policy["audit_seed"]}:{row["case_id"]}'.encode())
@@ -238,9 +248,11 @@ def mine(config, manifest, output, cached_readers=False):
                 item["recommended"] for item in row["proposals"]
             ) and row["task"] in miner.models[policy["strong_teacher"]]["tasks"]]
             chosen = candidates[:policy["strong_budget"]]
-            enriched = pool.map(lambda row: miner.run(row, row), chosen)
+            enriched = pool.map(lambda row: score_region(row, row), chosen)
             updates = {row["case_id"]: row for row in enriched}
             rows = [updates.get(row["case_id"], row) for row in rows]
+    if check_cancelled:
+        check_cancelled()
     chosen = select(rows, policy)
     write_rows(output / "evidence.jsonl", rows)
     write_rows(output / "review.jsonl", chosen)
