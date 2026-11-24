@@ -1,5 +1,6 @@
 """Prepare and evaluate recognition crops from OmniDocBench."""
 import json
+from math import isclose
 import random
 import re
 from collections import Counter, defaultdict
@@ -9,6 +10,7 @@ from urllib.parse import quote
 from urllib.request import urlopen
 
 from .formats import NUMBER, edit_distance, normalize, table_cells, table_metrics
+from .mining import choose_transcription
 from .store import atomic_output, digest, json_text, read_rows, write_rows
 
 OMNI_REVISION = "aa1ee96d106dbe53d0ae59474d75c6e6d9b53fec"
@@ -208,38 +210,77 @@ def model_metrics(task, label, reference, text_cer, table_teds):
             "correct": score >= table_teds and structure == 1 and numbers == 1}
 
 
+def reference_comparison(row, metrics):
+    """Audit a previously selected transcription against all valid OCR outputs."""
+    metric = "cer" if row["task"] == "text" else "teds"
+    scores = {alias: values[metric] for alias, values in metrics.items()
+              if alias in row["models"] and row["models"][alias].get("status") == "ok"
+              and row["models"][alias].get("label") and values.get(metric) is not None}
+    best = (min if metric == "cer" else max)(scores.values(), default=None)
+    closest = [alias for alias, value in scores.items() if isclose(value, best, rel_tol=0, abs_tol=1e-12)]
+    selected = row.get("selection", {}).get("model_alias")
+    return {"metric": metric, "selected_alias": selected, "selected_value": scores.get(selected),
+            "best_value": best, "closest_aliases": closest, "valid_candidates": len(scores),
+            "is_closest": selected in closest if selected in scores else None}
+
+
+def selection_summary(comparisons):
+    comparable = [item for item in comparisons if item["is_closest"] is not None and item["valid_candidates"] >= 2]
+    return {"with_reference": len(comparisons), "comparable": len(comparable),
+            "closest": sum(item["is_closest"] for item in comparable)}
+
+
+def reference_metrics(row, reference, text_cer=0.02, table_teds=0.95):
+    by_label = {}
+    result = {}
+    for alias, model in row["models"].items():
+        if model["status"] in {"service_error", "incomplete"}:
+            continue
+        label = model.get("label")
+        if label not in by_label:
+            by_label[label] = model_metrics(row["task"], label, reference, text_cer, table_teds)
+        result[alias] = by_label[label]
+    return result
+
+
 def evaluate(evidence_path, reference_path, output, budget, partition, text_cer=0.02, table_teds=0.95):
     references = {region_key(row): row for row in read_rows(reference_path)}
     evaluated = []
+    details = []
+    summary_path = evidence_path.with_name("summary.json")
+    policy = json.loads(summary_path.read_bytes())["mining"] if summary_path.is_file() else None
     documents = set()
     excluded_operations = 0
     unmatched = 0
     for row in read_rows(evidence_path):
-        if row.get("eval_partition") != partition:
+        if partition != "all" and row.get("eval_partition") != partition:
             continue
         ref = references.get(region_key(row))
-        if ref is None:
+        if ref is None or not (ref.get("reference") or "").strip():
             unmatched += 1
             continue
         if ref["image_sha256"] != row["image_sha256"]:
             raise ValueError(f"reference crop differs from evidence: {row['case_id']}")
+        if "selection" not in row and policy:
+            row["selection"] = choose_transcription(row["models"], row["target_alias"], policy)
+        metrics = reference_metrics(row, ref["reference"], text_cer, table_teds)
+        detail = {"case_id": row["case_id"], "task": row["task"], "reference": ref["reference"],
+                  "models": metrics, "selection_gt": reference_comparison(row, metrics)}
+        details.append(detail)
         if row["target_operational_error"]:
             excluded_operations += 1
             continue
         documents.add(row["doc_id"])
-        metrics = {alias: model_metrics(row["task"], model.get("label"), ref["reference"], text_cer, table_teds)
-                   for alias, model in row["models"].items() if model["status"] not in {"service_error", "incomplete"}}
         target_error = not metrics[row["target_alias"]]["correct"]
         repairable = target_error and any(result["correct"] for alias, result in metrics.items()
                                           if alias != row["target_alias"])
         distances = [model["distance_to_target"] for model in row["models"].values()
                      if "distance_to_target" in model]
-        evaluated.append({"case_id": row["case_id"], "task": row["task"], "reference": ref["reference"],
-                          "models": metrics, "target_error": target_error, "repairable": repairable,
-                          "disagreement": max(distances, default=0), "priority": row["priority"],
-                          "hard_case": row["hard_case"]})
+        detail.update(target_error=target_error, repairable=repairable, disagreement=max(distances, default=0),
+                      priority=row["priority"], hard_case=row["hard_case"])
+        evaluated.append(detail)
 
-    if not evaluated:
+    if not details:
         raise ValueError(f"no matched, evaluable cases in partition {partition!r}")
     strategies = {}
     for task in ("all", "text", "table"):
@@ -280,7 +321,8 @@ def evaluate(evidence_path, reference_path, output, budget, partition, text_cer=
               "dataset": metadata, "excluded_target_operations": excluded_operations,
               "unmatched": unmatched, "text_cer_threshold": text_cer, "table_teds_threshold": table_teds,
               "model_metrics": model_summary, "strategies": strategies}
-    write_rows(output / "cases.jsonl", evaluated)
+    report["selection_gt"] = selection_summary([item["selection_gt"] for item in details])
+    write_rows(output / "cases.jsonl", details)
     with atomic_output(output / "report.json") as temporary:
         temporary.write_text(json_text(report), encoding="utf-8")
     return report

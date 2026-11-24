@@ -93,6 +93,7 @@
     "disagreement": 0.12,
     "judge_gain": 0.35,
     "proposal_judge": 0.9,
+    "selection_margin": 0.05,
     "proposal_families": 2,
     "review_per_task": {"text": 300, "table": 300},
     "review_per_document": 30,

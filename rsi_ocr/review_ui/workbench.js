@@ -6,7 +6,10 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, character => ({
 }[character]));
 const names = {paddle: "PaddleOCR‑VL", oxr: "OXR‑1.0", ovis: "OvisOCR3", jev: "Jev"};
 const tasks = {text: "文字", table: "表格"};
-const statuses = {pending: "未复核", approved: "Pass", rejected: "Not pass", needs_check: "待核查"};
+const selectionReasons = {low_score: "最高分偏低", close_scores: "不同转录的分数接近",
+  partial_scores: "部分候选评分失败", judge_disabled: "Jev 已关闭，按模型顺序选取",
+  no_valid_output: "没有有效转录", no_scored_output: "没有候选通过 Jev 评分"};
+const statuses = {pending: "未复核", approved: "已通过", rejected: "已驳回", needs_check: "待核查"};
 const reasons = {
   low_target_judge: "Paddle 分数低", teacher_disagreement: "模型输出分歧",
   better_judged_candidate: "候选分数更高", numeric_conflict: "数字冲突",
@@ -90,15 +93,13 @@ function renderQueue() {
   const list = q("#queue-list");
   list.innerHTML = state.rows.map(row => {
     const selected = state.current === row.case_id;
-    const key = row.reasons[0];
-    const hint = reasons[key] || key || (row.audit_sample ? "随机抽审" : "未触发规则");
-    const title = row.doc_id.replace(/^(newspaper|jiaocaineedrop|yanbaopptmerge)_/i, "");
+    const title = row.doc_id.split("/").pop();
+    const status = row.review_status !== "pending" ? statuses[row.review_status] :
+      row.selection_status !== "selected" ? "待核对" : "";
     return `<button class="queue-item ${selected ? "selected" : ""}" data-case="${esc(row.case_id)}"
       aria-current="${selected}" title="${esc(row.doc_id)} · ${esc(row.region_id)}">
-      <span class="queue-meta"><span class="task-chip">${esc(tasks[row.task] || row.task)}</span>
-      <span class="row-score">${number(row.priority)}</span>
-      <span class="row-status ${esc(row.review_status)}">${esc(statuses[row.review_status])}</span></span>
-      <strong>${esc(title)}</strong><span class="row-detail">${esc(row.region_id)} · ${esc(hint)}</span>
+      <strong>${esc(title)}</strong><span class="queue-meta"><span class="row-detail">页 ${esc(row.page_id)} · 区域 ${esc(row.region_id)} · ${esc(tasks[row.task] || row.task)}</span>
+      <span class="row-status ${esc(row.review_status)}">${esc(status)}</span></span>
     </button>`;
   }).join("") || '<p class="empty">没有符合条件的样本。</p>';
   q("#queue-count").textContent = state.rows.length + " 条";
@@ -106,7 +107,7 @@ function renderQueue() {
 
 const difficultyLabels = {all: "全部", hard: "难例", easy: "非难例", error: "异常"};
 const difficultyOf = row => row.operational ? "error" : row.hard_case ? "hard" : "easy";
-const eligible = row => difficultyOf(row) === "easy" && row.review_status === "pending" && row.valid_target;
+const eligible = row => difficultyOf(row) === "easy" && row.review_status === "pending" && row.selection_status === "selected";
 function filterQueue() {
   const query = q("#search").value.trim().toLowerCase();
   const scope = q("#scope").value;
@@ -114,22 +115,26 @@ function filterQueue() {
   const reason = q("#reason").value;
   const judge = q("#judge").value;
   const gold = q("#gold").value;
+  const filterCount = [state.level, state.task, status, reason, judge, gold].filter(value => value !== "all").length;
+  q("#filter-count").textContent = filterCount ? " · " + filterCount : "";
   state.rows = state.data.rows.filter(row => (
     (state.level === "all" || difficultyOf(row) === state.level) &&
     (scope === "all" || (scope === "queue" && row.queued) || (scope === "audit" && row.audit_sample)
+      || (scope === "selection_check" && row.selection_status !== "selected")
       || (scope === "outside" && !row.queued))
     && (state.task === "all" || row.task === state.task)
     && (status === "all" || row.review_status === status)
     && (reason === "all" || row.reasons.includes(reason))
     && (judge === "all" || (row.judge_status || "missing") === judge)
-    && (gold === "all" || (gold === "error" && row.target_error) || (gold === "repairable" && row.repairable))
+    && (gold === "all" || (gold === "miss" && row.gt_closest === false) || (gold === "hit" && row.gt_closest === true)
+      || (gold === "error" && row.target_error) || (gold === "repairable" && row.repairable))
     && (!query || [row.doc_id, row.region_id, row.case_id].join(" ").toLowerCase().includes(query))
   )).sort((a, b) => (b.priority ?? -1) - (a.priority ?? -1) || a.case_id.localeCompare(b.case_id));
   q("#difficulty").innerHTML = Object.entries(difficultyLabels).map(([key,label]) =>
     `<button data-level="${key}" aria-pressed="${state.level === key}">${label} ${state.data.rows.filter(r => key === "all" || difficultyOf(r) === key).length}</button>`).join("");
   q("#bulk").hidden = state.level !== "easy";
   const count = state.rows.filter(eligible).length;
-  q("#bulk").textContent = `一键通过 ${count} 条 · 采用 Paddle`;
+  q("#bulk").textContent = `一键通过 ${count} 条 · 采用择优结果`;
   q("#bulk").disabled = !count || state.saving;
   q("#undo").hidden = !sessionStorage.getItem("undo-" + state.batch);
   renderQueue();
@@ -145,6 +150,13 @@ function resetOptions(selector, values, labels, placeholder) {
   select.replaceChildren(new Option(placeholder, "all"), ...values.map(value => new Option(labels[value] || value, value)));
 }
 
+function clearFilters() {
+  q("#search").value = "";
+  state.level = "all";
+  taskFilter("all");
+  for (const id of ["scope", "status", "reason", "judge", "gold"]) q("#" + id).value = "all";
+}
+
 async function loadBatch(batch) {
   const request = ++state.request;
   state.loading = true;
@@ -152,6 +164,7 @@ async function loadBatch(batch) {
   state.current = null;
   state.case = null;
   state.data = null;
+  q("#export-menu").hidden = true;
   if (!q("#settings").hidden) initSettings();
   q("#queue-list").replaceChildren();
   q("#queue-count").textContent = "";
@@ -162,17 +175,17 @@ async function loadBatch(batch) {
     if (request !== state.request) return;
     state.data = data;
     state.loading = false;
+    q("#batch").hidden = false;
+    q("#view-review").disabled = q("#view-overview").disabled = false;
+    q("#export-menu").hidden = false;
     if (!q("#settings").hidden) initSettings();
-    q("#search").value = "";
-    state.level = "all";
-    q("#scope").value = "all";
-    q("#status").value = "all";
-    taskFilter("all");
-    q("#gold").value = "all";
-    q("#reference-filter").hidden = !data.report;
+    clearFilters();
+    q("#reference-filter").hidden = !data.selection_gt?.with_reference;
+    q("#benchmark-filters").hidden = !data.report;
     resetOptions("#reason", [...new Set(data.rows.flatMap(row => row.reasons))], reasons, "全部原因");
     resetOptions("#judge", [...new Set(data.rows.map(row => row.judge_status || "missing"))], judgeStatuses, "全部评分状态");
     q("#review-download").href = batchPath() + "/export/review";
+    q("#selected-download").href = batchPath() + "/export/selected";
     q("#training-download").hidden = !data.rows.some(row => row.exportable && row.split !== "val");
     q("#validation-download").hidden = !data.rows.some(row => row.exportable && row.split === "val");
     renderOverview();
@@ -209,12 +222,9 @@ async function selectCase(id, {reveal = false} = {}) {
     const data = await api(casePath());
     if (request !== state.request) return;
     state.case = data;
-    const alternatives = Object.keys(data.models).filter(alias => alias !== data.target_alias);
     const reviewedModel = data.decision?.model_alias;
-    state.compare = reviewedModel && Object.hasOwn(data.models, reviewedModel) ? reviewedModel : data.target_alias;
-    if (!data.models[state.compare].label && !data.decision) {
-      state.compare = alternatives.find(alias => data.models[alias].label) || data.target_alias;
-    }
+    state.compare = reviewedModel && Object.hasOwn(data.models, reviewedModel)
+      ? reviewedModel : data.selection.model_alias || "";
     const first = Object.keys(data.models).find(k=>data.models[k].label);
     if (!data.models[data.target_alias].label && first) await fetchComparison(data,first);
     if (request !== state.request) return;
@@ -451,7 +461,26 @@ function renderTablePreview(row, visible, base, views) {
 function renderComparison() {
   const row = state.case;
   const alias = state.compare;
-  const model = row.models[alias];
+  const model = row.models[alias] || {};
+  const selection = row.selection;
+  const automatic = selection.model_alias;
+  const heading = !alias || alias === automatic ? "自动择优结果" :
+    row.decision?.model_alias === alias ? "上次复核所选转录" : "人工所选转录";
+  q("#selection-heading").textContent = heading;
+  q("#selection-model").textContent = alias ? nameOf(alias) : "";
+  const details = [];
+  if (alias && alias !== automatic) details.push(automatic ? "自动择优 · " + nameOf(automatic) : "无自动择优结果");
+  if (selection.prob_yes != null) details.push("择优分 " + number(selection.prob_yes));
+  if (selection.margin != null) details.push("领先 " + number(selection.margin));
+  if (selection.reasons.length) details.push("待核对 · " + selection.reasons.map(key => selectionReasons[key] || key).join("、"));
+  q("#selection-detail").textContent = details.join("　");
+  q("#selection-detail").classList.toggle("needs-attention", selection.reasons.length > 0);
+  const preview = row.baseline_views[alias];
+  q("#selection-output").innerHTML = alias ? output(model.label, preview, false) : '<p class="output-empty">暂无可采用的评分结果</p>';
+  if (row.task === "table") {
+    q("#selection-table").hidden = !preview?.rows;
+    q("#selection-table").textContent = `查看完整表格 · ${preview?.rows?.length || 0} 行 × ${sheetWidth(preview)} 列`;
+  }
   const base = q("#compare-with").value;
   const views = comparisonViews(row, base);
   const keys = [row.target_alias, ...Object.keys(row.models).filter(key => key !== row.target_alias)];
@@ -463,20 +492,20 @@ function renderComparison() {
   }).join("");
   q("#model-pair").style.setProperty("--models", visible.length);
   q("#adopt-model").value = alias;
-  if (row.task === "table") {
-    renderTablePreview(row, visible, base, views);
-  } else {
-    q("#model-pair").innerHTML = visible.map(key => resultCard(row, key, views[key], key !== base, q("#only-changes")?.checked)).join("");
+  if (q("#comparison-details").open) {
+    if (row.task === "table") {
+      renderTablePreview(row, visible, base, views);
+    } else {
+      q("#model-pair").innerHTML = visible.map(key => resultCard(row, key, views[key], key !== base, q("#only-changes")?.checked)).join("");
+    }
   }
   q("#raw-output").textContent = model.raw || model.detail || "无原始输出";
-  q("#raw-title").textContent = nameOf(alias) + " · 原始输出与请求";
+  q("#raw-title").textContent = alias ? nameOf(alias) + " · 原始输出与请求" : "原始输出与请求";
   const info = {...model};
   delete info.raw;
   delete info.label;
   q("#request-info").textContent = JSON.stringify(info, null, 2);
-  q("#review-choice").innerHTML = `<strong>${esc(nameOf(alias))}</strong><span>${
-    model.label ? "Pass 将采用所选模型的转录" : "当前模型没有可用转录，请切换模型或点 Not pass"
-  }${row.export_split ? "" : " · 仅记录评测判定"}</span>`;
+  q("#review-choice").textContent = row.export_split ? "人工复核" : "评测判定";
   q("#pass").disabled = !model.label || state.saving;
   q("#reject").disabled = state.saving;
   q("#table-pass").disabled = q("#pass").disabled;
@@ -505,6 +534,22 @@ function pageFrame(url, geometry) {
   return `<span class="page-frame"><img src="${esc(url)}" ${size} draggable="false" alt="${box ? "已框出目标区域的原页" : "原页"}">${box}</span>`;
 }
 
+function referenceVerdict(audit) {
+  if (!audit) return "";
+  const metric = audit.metric.toUpperCase();
+  const direction = audit.metric === "cer" ? "越低越好" : "越高越好";
+  let verdict = "无有效候选";
+  if (audit.is_closest === null && audit.valid_candidates) verdict = "无可比较的自动择优结果";
+  if (audit.is_closest !== null) {
+    verdict = audit.valid_candidates === 1 ? "仅一份有效候选" :
+      audit.is_closest ? "自动择优命中最近候选" : "有更贴近 GT 的候选";
+  }
+  const selected = audit.selected_value == null ? "" : `自动择优 ${nameOf(audit.selected_alias)} · ${percent(audit.selected_value)}`;
+  const best = audit.closest_aliases.length ? `最贴近 GT：${audit.closest_aliases.map(nameOf).join("、")} · ${percent(audit.best_value)}` : "";
+  return `<section class="gt-comparison"><strong>GT 对照 · ${verdict}</strong>
+    <small>${esc([metric + " " + direction, selected, best].filter(Boolean).join("　／　"))}</small></section>`;
+}
+
 function renderCase() {
   const row = state.case;
   const listed = state.rows.find(item => item.case_id === row.case_id);
@@ -521,8 +566,8 @@ function renderCase() {
           <span class="case-status ${esc(stateLabel)}">${esc(statuses[stateLabel])}</span>
           ${listed?.target_error ? '<span class="case-status incorrect">Paddle 有误</span>' : ""}
           ${listed?.repairable ? '<span class="case-status correct">有正确替代</span>' : ""}</div>
-        <h2>区域 ${esc(row.region_id)}</h2>
-        <p title="${esc(row.doc_id)}">${esc(row.doc_id)} · 页 ${esc(row.page_id)}</p>
+        <h2 title="${esc(row.doc_id)}">${esc(row.doc_id.split("/").pop())}</h2>
+        <p>第 ${esc(row.page_id)} 页　/　区域 ${esc(row.region_id)}</p>
       </div>
       <div class="pager">
         <button id="previous" type="button">上一条</button>
@@ -530,34 +575,35 @@ function renderCase() {
         <button id="next" type="button">下一条</button>
       </div>
     </div>
-        <div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset>
-          <label>Pass 采用<select id="adopt-model">${Object.keys(row.models).map(key =>
-            `<option value="${esc(key)}">${esc(nameOf(key))} · ${number(row.models[key].judge?.prob_yes)}</option>`).join("")}</select></label></div>
-    <section class="decision-summary">
-      <div><h3>${listed?.queued ? (row.audit_sample ? "随机抽检入队" : "难例入队") : "未入审核队列"} · 判定依据</h3><div class="chips">${badges}
-        ${row.audit_sample && row.reasons.length ? '<span class="reason-chip">同时命中随机抽审</span>' : ""}</div>${evidenceDetails(row)}</div>
-      <div class="priority"><span>排序分</span><strong>${number(row.priority)}</strong></div>
-    </section>
     <div class="comparison-layout">
-      ${row.task === "table" ? '<details class="source-fold"><summary>查看原页与区域裁图</summary>' : ""}
-      <section class="panel source">
-        <header class="panel-heading"><h3>原页定位</h3>
-          ${row.page_geometry ? `<button type="button" data-image="${esc(page)}" data-page="true">查看原页</button>` : ""}</header>
-        ${row.page_geometry ? `<button type="button" class="page-preview" data-image="${esc(page)}" data-page="true">
-          ${pageFrame(page, row.page_geometry)}</button>
-          <p class="location-caption"><span class="${row.page_geometry.box ? "located" : ""}"></span>${
-            row.page_geometry.box ? "框内为当前区域" : "该裁图的位置待核对"}</p>` : '<p class="empty">原页文件不可用。</p>'}
-        ${row.has_crop ? `<button type="button" class="crop" data-image="${esc(crop)}">
-          <img src="${esc(crop)}" alt="区域 ${esc(row.region_id)} 的裁图"><span>放大裁图</span></button>`
-          : '<p class="empty">裁图文件不可用。</p>'}
+      <figure class="source original-pane"><figcaption>整页原图 <span>第 ${esc(row.page_id)} 页</span></figcaption>
+          ${row.page_geometry ? `<button type="button" class="page-preview" aria-label="放大整页原图" data-image="${esc(page)}" data-page="true">
+          ${pageFrame(page, row.page_geometry)}</button>` : '<p class="empty">原页文件不可用。</p>'}
+      </figure>
+      <figure class="source crop-pane"><figcaption>区域裁图 <span>区域 ${esc(row.region_id)}</span></figcaption>
+          ${row.has_crop ? `<button type="button" class="crop" aria-label="放大区域裁图" data-image="${esc(crop)}">
+          <img src="${esc(crop)}" alt="区域 ${esc(row.region_id)} 的裁图"></button>` : '<p class="empty">裁图文件不可用。</p>'}
+      </figure>
+      <section class="panel selection-pane">
+        <header class="panel-heading"><h3 id="selection-heading"></h3><span id="selection-model"></span>
+          ${row.task === "table" ? '<button type="button" id="selection-table" data-open-sheet></button>' : ""}</header>
+        <div class="output-scroll" id="selection-output" tabindex="0"></div>
+        <p class="selection-detail" id="selection-detail"></p>
+        ${referenceVerdict(row.selection_gt)}
       </section>
-      ${row.task === "table" ? "</details>" : ""}
-      <section class="panel comparison">
+      <details class="panel inspection-details" id="comparison-details"><summary>各模型转录与判定依据</summary>
+        <div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset>
+          <label>人工采用<select id="adopt-model"><option value="" disabled>选择转录</option>${Object.keys(row.models).map(key =>
+            `<option value="${esc(key)}">${esc(nameOf(key))} · ${number(row.models[key].judge?.prob_yes)}</option>`).join("")}</select></label></div>
+        <section class="decision-summary">
+          <div><h3>${listed?.queued ? (row.audit_sample ? "随机抽检入队" : "难例入队") : "未入审核队列"} · 判定依据</h3><div class="chips">${badges}</div>${evidenceDetails(row)}</div>
+          <div class="priority"><span>排序分</span><strong>${number(row.priority)}</strong></div>
+        </section>
+      <section class="comparison">
         <header class="panel-heading"><h3>识别对照</h3><div class="panel-actions"><span>Jev 一致性分</span>
           ${row.task === "table" ? '<button type="button" id="open-table">放大表格</button>' : ""}</div></header>
         <div class="diff-controls">
           <label>差异基准<select id="compare-with">${Object.keys(row.models).filter(k=>row.models[k].label).map(k=>`<option value="${esc(k)}" ${k===row.target_alias?"selected":""}>${esc(nameOf(k))}</option>`).join("")}${row.reference?'<option value="reference">参考标注</option>':""}</select></label>
-          ${row.reference ? "" : "<span>无参考标注</span>"}
           ${row.task === "text" ? '<label><input id="only-changes" type="checkbox">仅看分歧</label>' : ""}
           ${row.task === "table" ? '<label><input id="diff-mode" type="checkbox">只看差异格</label>' : ""}
           <label><input id="difference" type="checkbox" checked>高亮差异</label>
@@ -568,14 +614,18 @@ function renderCase() {
         <details class="inspection-details"><summary id="raw-title"></summary>
           <pre id="raw-output"></pre><pre id="request-info"></pre></details>
       </section>
+      </details>
     </div>
     <section class="review-dock" aria-label="人工复核">
       <div class="review-selection" id="review-choice"></div>
       <div class="review-actions">
-        <button id="reject" type="button" data-review="rejected">Not pass</button>
-        <button id="pass" class="primary" type="button" data-review="approved">Pass</button>
+        <button id="reject" type="button" data-review="rejected">驳回</button>
+        <button id="pass" class="primary" type="button" data-review="approved">确认通过</button>
       </div>
     </section>`;
+  q("#comparison-details").addEventListener("toggle", event => {
+    if (event.currentTarget.open) renderComparison();
+  });
   renderComparison();
   if (decision?.timestamp) {
     const context = document.createElement("small");
@@ -610,7 +660,7 @@ async function saveReview(status) {
   try {
     const decision = await api(path + "/decision", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({status, model_alias: state.compare}),
+      body: JSON.stringify({status, model_alias: state.compare || state.case.target_alias}),
     });
     row.review_status = decision.status;
     state.case.decision = decision;
@@ -628,7 +678,7 @@ async function saveReview(status) {
   } finally {
     state.saving = false;
     q("#batch").disabled = false;
-    if (state.case && q("#pass")) q("#pass").disabled = !state.case.models[state.compare].label;
+    if (state.case && q("#pass")) q("#pass").disabled = !state.case.models[state.compare]?.label;
     if (q("#reject")) q("#reject").disabled = false;
     q("#table-pass").disabled = Boolean(q("#pass")?.disabled);
     q("#table-reject").disabled = false;
@@ -770,9 +820,11 @@ function renderOverview() {
   rows.forEach(row => row.reasons.forEach(key => { counts[key] = (counts[key] || 0) + 1; }));
   q("#overview").innerHTML = `<h2>批次总览</h2><div class="stat-grid">${cards.map(([name, value]) =>
     `<div class="stat-card"><span>${name}</span><strong>${value}</strong></div>`).join("")}</div>
+    ${state.data.selection_gt?.with_reference ? `<section class="panel gt-comparison"><strong>自动择优与 GT 对照</strong>
+      <small>匹配 GT ${state.data.selection_gt.with_reference} 个区域 · 有至少两份有效候选且已择优 ${state.data.selection_gt.comparable} 个 · 命中最近候选 ${state.data.selection_gt.closest} 个</small></section>` : ""}
     ${sources.length ? `<details class="panel inspection-details"><summary>输入文件 · ${sources.length} 份 / ${sources.reduce((n,[,pages])=>n+pages,0)} 页</summary>
       ${sources.map(([doc,pages])=>`<div class="service-row"><strong>${esc(doc)}</strong><span>${pages} 页</span></div>`).join("")}</details>` : ""}
-    ${report ? '<section class="panel overview-panel"><header class="panel-heading"><h3>运行时策略对比 · 留出集</h3><select id="strategy-task" aria-label="评测任务"><option value="all">全部任务</option><option value="text">文字</option><option value="table">表格</option></select></header><div id="strategy-grid"></div></section>' : ""}
+    ${report ? `<section class="panel overview-panel"><header class="panel-heading"><h3>运行时策略对比 · ${({holdout:"留出集",calibration:"校准集",all:"全部分区"})[report.partition] || "评测集"}</h3><select id="strategy-task" aria-label="评测任务"><option value="all">全部任务</option><option value="text">文字</option><option value="table">表格</option></select></header><div id="strategy-grid"></div></section>` : ""}
     <div class="overview-grid">
     <section class="panel overview-panel"><header class="panel-heading"><h3>入队原因分布</h3></header>${Object.entries(counts)
       .sort((a, b) => b[1] - a[1]).map(([key, count]) =>
@@ -807,6 +859,7 @@ function renderStrategy() {
 }
 
 function view(page) {
+  q("#library").hidden = page !== "library";
   q("#workspace").hidden = page !== "review";
   q("#settings").hidden = page !== "settings";
   q("#view-settings").setAttribute("aria-pressed",page === "settings");
@@ -814,14 +867,31 @@ function view(page) {
   q("#overview").hidden = page !== "overview";
   q("#view-review").setAttribute("aria-pressed", page === "review");
   q("#view-overview").setAttribute("aria-pressed", page === "overview");
+  if (page === "library") refreshImports();
 }
 
 q("#view-review").addEventListener("click", () => view("review"));
 q("#view-overview").addEventListener("click", () => view("overview"));
-q("#batch").addEventListener("change", event => loadBatch(event.target.value));
+q("#mobile-queue").onclick = event => {
+  const open = q("#workspace").classList.toggle("queue-open");
+  event.currentTarget.setAttribute("aria-expanded", String(open));
+};
+q("#batch").addEventListener("change", event => {
+  if (!q("#library").hidden) view("review");
+  loadBatch(event.target.value);
+});
+q("#clear-filters").onclick = () => {
+  if (!state.data || state.saving) return;
+  clearFilters();
+  filterQueue();
+};
 q("#queue-list").addEventListener("click", event => {
   const item = event.target.closest("[data-case]");
-  if (item && !state.saving && !state.loading) selectCase(item.dataset.case, {reveal: true});
+  if (item && !state.saving && !state.loading) {
+    q("#workspace").classList.remove("queue-open");
+    q("#mobile-queue").setAttribute("aria-expanded", "false");
+    selectCase(item.dataset.case, {reveal: true});
+  }
 });
 q("#task-filters").addEventListener("click", event => {
   if (!event.target.dataset.task || !state.data || state.saving) return;
@@ -907,43 +977,116 @@ q("#table-reject").addEventListener("click", () => saveReview("rejected"));
 for (const item of document.querySelectorAll("[data-export]")) {
   item.addEventListener("click", () => downloadSft(item.dataset.export));
 }
-api("/api/batches").then(batches => {
-  q("#batch").replaceChildren(...Object.entries(batches).map(([id, label]) => new Option(label, id)));
-  if (q("#batch").value) return loadBatch(q("#batch").value);
-  q("#inspection").innerHTML = '<p class="empty">点击「导入结果」选择命令行生成的批次。</p>';
-}).catch(error => notice(error.message, true));
+let imports = [];
+let readingImports = 0;
+let importing = "";
+let visibleImports = 8;
 
-q("#import-open").onclick = async () => {
-  const select = q("#import-list"), submit = q("#import-submit");
-  q("#import-dialog").showModal();
-  select.replaceChildren();
-  submit.disabled = true;
+function batchLabel(name) {
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})\.\d+Z$/.exec(name);
+  if (!match) return name;
+  const [, year, month, day, hour, minute, second] = match;
+  const date = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`);
+  return Number.isNaN(date.getTime()) ? name : date.toLocaleString("zh-CN", {hour12: false});
+}
+
+function renderImports() {
+  const query = q("#import-search").value.trim().toLowerCase();
+  const items = imports.filter(item => [item.name, item.first_doc, batchLabel(item.name)]
+    .some(value => value?.toLowerCase().includes(query)));
+  const remaining = items.length - visibleImports;
+  q("#import-count").textContent = query ? `${items.length} / ${imports.length}` : String(imports.length);
+  q("#import-more").hidden = remaining <= 0;
+  q("#import-more").textContent = `显示更多批次（还有 ${remaining} 个）`;
+  q("#import-message").textContent = !imports.length ? "暂无已完成的批次。运行 glyphstack run 后，点击刷新。" :
+    !items.length ? "没有匹配的批次，可更换文件名或清空搜索。" : "";
+  q("#import-list").innerHTML = items.slice(0, visibleImports).map(item => {
+    const title = item.first_doc || batchLabel(item.name);
+    const extension = item.first_doc?.match(/\.(pdf|jpe?g|png)$/i)?.[1].toUpperCase();
+    const cover = item.has_cover ? `<img src="/api/imports/${encodeURIComponent(item.name)}/cover" alt="" loading="lazy" decoding="async">` : "";
+    return `<button class="batch-card" data-import="${esc(item.name)}" title="${esc(title)}"
+      aria-label="${esc("导入并复核 · " + title + " · " + batchLabel(item.name))}" ${importing ? "disabled" : ""}>
+      <span class="batch-cover" aria-hidden="true">
+        <span class="file-standin"></span>${cover}
+        ${extension ? `<span class="file-extension">${esc(extension)}</span>` : ""}
+      </span>
+      <span class="batch-info"><strong>${esc(title)}</strong>
+      <small>${item.first_doc ? esc(batchLabel(item.name)) : ""}</small></span>
+      <span class="batch-action"><span>${Number.isInteger(item.regions) ? item.regions + " 个区域" : ""}</span>
+      <b>${importing === item.name ? "正在导入…" : "导入并复核 →"}</b></span></button>`;
+  }).join("");
+}
+
+async function refreshImports() {
+  const revision = ++readingImports;
+  q("#import-refresh").disabled = true;
   q("#import-message").textContent = "正在读取结果目录…";
   try {
     const data = await api("/api/imports");
-    q("#import-root").textContent = data.directory;
-    select.replaceChildren(...data.names.map(name => new Option(name, name)));
-    submit.disabled = !data.names.length;
-    q("#import-message").textContent = data.names.length ? "" : "尚无完成的批次。先用 glyphstack run 处理文件，再重新打开。";
-  } catch (error) { q("#import-message").textContent = error.message; }
+    if (revision !== readingImports) return;
+    imports = data.batches || data.names.map(name => ({name}));
+    q("#import-root").textContent = data.directory ? "结果目录　" + data.directory : "";
+    q("#import-search").hidden = imports.length < 2;
+    if (q("#import-search").hidden) q("#import-search").value = "";
+    renderImports();
+  } catch (error) {
+    if (revision === readingImports) q("#import-message").textContent = "读取失败 · " + error.message;
+  } finally {
+    if (revision === readingImports) q("#import-refresh").disabled = Boolean(importing);
+  }
+}
+
+q("#import-open").onclick = () => { if (!state.saving) view("library"); };
+q("#import-refresh").onclick = refreshImports;
+q("#import-search").oninput = () => { visibleImports = 8; renderImports(); };
+q("#import-more").onclick = () => {
+  visibleImports += 8;
+  renderImports();
+  q("#import-list").querySelectorAll("[data-import]")[visibleImports - 8]?.focus();
 };
-q("#import-submit").onclick = async () => {
-  q("#import-submit").disabled = true;
+q("#import-list").addEventListener("error", event => {
+  if (event.target.tagName === "IMG") event.target.remove();
+}, true);
+q("#import-list").onclick = async event => {
+  const trigger = event.target.closest("button[data-import]");
+  if (!trigger || importing || state.saving) return;
+  importing = trigger.dataset.import;
+  q("#import-refresh").disabled = true;
+  q("#import-list").querySelectorAll("button").forEach(button => { button.disabled = true; });
+  trigger.querySelector(".batch-action b").textContent = "正在导入…";
+  let errorMessage = "";
   try {
-    const batch = await api("/api/imports/" + encodeURIComponent(q("#import-list").value), {method:"POST"});
+    const batch = await api("/api/imports/" + encodeURIComponent(importing), {method:"POST"});
     const select = q("#batch");
-    if (![...select.options].some(o=>o.value===batch.id)) select.add(new Option(batch.name,batch.id));
+    if (![...select.options].some(option => option.value === batch.id)) select.add(new Option(batchLabel(batch.name), batch.id));
     select.value = batch.id;
-    q("#import-dialog").close();
-    if (q("#settings").hidden) view("review");
+    view("review");
     await loadBatch(batch.id);
-  } catch (error) { q("#import-message").textContent = error.message; }
-  finally { q("#import-submit").disabled = false; }
+  } catch (error) {
+    errorMessage = "导入失败 · " + error.message;
+  } finally {
+    importing = "";
+    q("#import-refresh").disabled = false;
+    renderImports();
+    if (errorMessage) q("#import-message").textContent = errorMessage;
+  }
 };
+
+api("/api/batches").then(batches => {
+  q("#batch").replaceChildren(...Object.entries(batches).map(([id, label]) => new Option(batchLabel(label), id)));
+  if (q("#batch").value) {
+    if (!q("#library").hidden) view("review");
+    return loadBatch(q("#batch").value);
+  }
+  if (!q("#library").hidden) refreshImports();
+}).catch(error => {
+  notice(error.message, true);
+  if (!q("#library").hidden) refreshImports();
+});
+
 q("#difficulty").onclick = event => {
   if (!event.target.dataset.level || state.saving) return;
   state.level = event.target.dataset.level;
-  q("#scope").value = "all";
   filterQueue();
 };
 async function bulkReview(undo) {

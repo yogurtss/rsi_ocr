@@ -65,7 +65,7 @@ def main(argv=None):
     evaluate.add_argument("references", type=absolute)
     evaluate.add_argument("--out", type=absolute, required=True)
     evaluate.add_argument("--budget", type=positive, default=25)
-    evaluate.add_argument("--partition", choices=("calibration", "holdout"), default="holdout")
+    evaluate.add_argument("--partition", choices=("calibration", "holdout", "all"), default="holdout")
     evaluate.add_argument("--text-cer", type=fraction, default=0.02, help="maximum CER for a correct text result")
     evaluate.add_argument("--table-teds", type=fraction, default=0.95, help="minimum TEDS for a correct table")
     export = sub.add_parser("export", help="export approved labels to ERNIEKit and ms-swift")

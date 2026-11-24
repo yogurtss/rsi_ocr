@@ -112,6 +112,48 @@ def proposals(case, inputs, target_alias, policy):
                                            row["judge"].get("prob_yes") or 0), reverse=True)
 
 
+def choose_transcription(models, target, policy):
+    order = dict.fromkeys([target, *policy.get("teachers", []), *sorted(models)])
+    valid = [key for key in order if key in models and models[key].get("status") == "ok" and models[key].get("label")]
+    choice = {"model_alias": None, "prob_yes": None, "margin": None, "status": "unavailable", "reasons": []}
+    if not valid:
+        return {**choice, "reasons": ["no_valid_output"]}
+    if not policy.get("judge"):
+        return {**choice, "model_alias": valid[0], "status": "needs_check", "reasons": ["judge_disabled"]}
+
+    ranked = []
+    partial = False
+    for alias in valid:
+        judge = models[alias].get("judge", {})
+        score = judge.get("prob_yes")
+        if judge.get("status") == "scored" and isinstance(score, (float, int)) and 0 <= score <= 1:
+            ranked.append((alias, score))
+        elif judge.get("status") != "precheck_reject":
+            partial = True
+    if not ranked:
+        return {**choice, "reasons": ["no_scored_output"]}
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    winner, score = ranked[0]
+    second = next((value for alias, value in ranked if models[alias]["label"] != models[winner]["label"]), None)
+    margin = round(score - second, 8) if second is not None else None
+    reasons = []
+    if score < policy["proposal_judge"]:
+        reasons.append("low_score")
+    if margin is not None and (margin == 0 or margin < policy.get("selection_margin", 0.05)):
+        reasons.append("close_scores")
+    if partial:
+        reasons.append("partial_scores")
+    return {"model_alias": winner, "prob_yes": score, "margin": margin,
+            "status": "needs_check" if reasons else "selected", "reasons": reasons}
+
+
+def selected_result(row):
+    selection = row["selection"]
+    alias = selection["model_alias"]
+    return {**{key: row[key] for key in ("case_id", "doc_id", "page_id", "region_id", "task", "image_sha256")},
+            **selection, "label": row["models"][alias]["label"] if alias else None}
+
+
 class Miner:
     def __init__(self, config, cache, base):
         self.policy = config["mining"]
@@ -155,6 +197,7 @@ class Miner:
         return {**{key: value for key, value in case.items() if key != "target"},
                 "case_id": case_id, "image_sha256": image_hash, "image": str(path), "models": inputs,
                 "target_alias": target, **evidence(case, inputs, target, self.policy),
+                "selection": choose_transcription(inputs, target, self.policy),
                 "proposals": proposals(case, inputs, target, self.policy)}
 
 
@@ -281,6 +324,7 @@ def mine(config, manifest, output, cached_readers=False, check_cancelled=None, r
         check_cancelled()
     chosen = select(rows, policy)
     write_rows(output / "evidence.jsonl", rows)
+    write_rows(output / "selected.jsonl", (selected_result(row) for row in rows))
     write_rows(output / "review.jsonl", chosen)
     write_rows(output / "candidate_labels.jsonl", (
         {"case_id": row["case_id"], "task": row["task"], "image_sha256": row["image_sha256"],

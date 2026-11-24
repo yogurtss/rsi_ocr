@@ -10,58 +10,72 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="identity"><span class="brand" aria-hidden="true">GS</span><h1>GlyphStack</h1></div>
+    <div class="identity"><span class="brand" aria-hidden="true"></span><h1>GlyphStack <span>Studio</span></h1></div>
     <nav class="navigation" aria-label="工作台页面">
-      <button id="view-review" aria-pressed="true">难例复核</button>
-      <button id="view-settings" aria-pressed="false">流程与设置</button>
-      <button id="view-overview" aria-pressed="false">批次总览</button>
+      <button id="view-review" aria-pressed="false" disabled>复核</button>
+      <button id="view-overview" aria-pressed="false" disabled>批次总览</button>
+      <button id="view-settings" aria-pressed="false">设置</button>
     </nav>
     <div class="top-controls">
-      <details id="runtime" class="export-menu" hidden><summary id="runtime-summary">模型后台</summary>
-        <div id="runtime-detail"></div></details>
       <label class="visually-hidden" for="batch">运行批次</label>
-      <button id="import-open">导入结果</button><select id="batch"></select>
-      <details class="export-menu">
+      <select id="batch" hidden></select>
+      <details id="export-menu" class="export-menu" hidden>
         <summary>导出</summary>
-        <div><a id="review-download">带时间戳的复核记录</a>
+        <div><a id="selected-download">区域自动择优结果 JSONL</a><a id="review-download">带时间戳的复核记录</a>
           <button type="button" id="training-download" data-export="train" hidden>SFT 训练集 JSONL</button>
           <button type="button" id="validation-download" data-export="val" hidden>SFT 验证集 JSONL</button></div>
       </details>
+      <button class="primary" id="import-open"><span aria-hidden="true">＋</span> 导入结果</button>
     </div>
   </header>
   <div id="notice" class="notice" role="status" hidden></div>
-  <div id="workspace" class="workspace">
+  <main class="library" id="library" aria-labelledby="library-title">
+    <header class="library-heading"><h2 id="library-title">导入识别结果</h2>
+      <p>选择服务器上已完成的批次，打开原图与识别结果。</p></header>
+    <section class="library-list" aria-labelledby="imports-heading">
+      <div class="library-tools"><h3 id="imports-heading">全部批次 <span id="import-count"></span></h3>
+        <input type="search" id="import-search" aria-label="搜索批次或文件名" placeholder="搜索批次或文件名" hidden>
+        <button id="import-refresh">刷新</button></div>
+      <p id="import-message" role="status">正在读取批次…</p>
+      <div id="import-list"></div>
+      <button type="button" id="import-more" hidden></button>
+      <footer id="import-root"></footer>
+    </section>
+  </main>
+  <div id="workspace" class="workspace" hidden>
+    <button id="mobile-queue" aria-expanded="false" aria-controls="sample-queue">样本目录</button>
     <aside id="sample-queue" class="queue" aria-label="样本队列">
       <div class="queue-controls">
         <div class="queue-title"><h2>样本队列</h2><span id="queue-count"></span></div>
         <label class="visually-hidden" for="search">搜索样本</label>
         <input id="search" type="search" placeholder="搜索文档、区域或样本 ID">
-        <div id="difficulty" class="segments" aria-label="难度"></div>
-        <button id="bulk" hidden></button><button id="undo" hidden>撤销上次批量通过</button>
-        <div id="task-filters" class="segments" aria-label="任务">
-          <button data-task="all" aria-pressed="true">全部</button>
-          <button data-task="text" aria-pressed="false">文字</button>
-          <button data-task="table" aria-pressed="false">表格</button>
-        </div>
-        <div class="filter-row">
           <label><span>样本范围</span><select id="scope">
             <option value="queue">审核队列</option><option value="all">全部样本</option>
-            <option value="audit">随机抽审</option><option value="outside">未入队</option>
+            <option value="selection_check">择优待核对</option><option value="audit">随机抽审</option><option value="outside">未入队</option>
           </select></label>
+        <details class="advanced" id="queue-filters"><summary>筛选条件<span id="filter-count"></span></summary>
+          <div id="difficulty" class="segments" aria-label="难度"></div>
+          <div id="task-filters" class="segments" aria-label="任务">
+            <button data-task="all" aria-pressed="true">全部类型</button>
+            <button data-task="text" aria-pressed="false">文字</button>
+            <button data-task="table" aria-pressed="false">表格</button>
+          </div>
           <label><span>复核状态</span><select id="status">
             <option value="all">全部状态</option><option value="pending">未复核</option>
-            <option value="approved">Pass</option><option value="rejected">Not pass</option>
+            <option value="approved">已通过</option><option value="rejected">已驳回</option>
             <option value="needs_check">待核查</option>
           </select></label>
-        </div>
-        <details class="advanced"><summary>更多筛选</summary>
           <label>入队原因<select id="reason"><option value="all">全部原因</option></select></label>
           <label>Paddle 评分状态<select id="judge"><option value="all">全部评分状态</option></select></label>
-          <label id="reference-filter">参考标注<select id="gold">
-            <option value="all">全部样本</option><option value="error">Paddle 有误</option>
-            <option value="repairable">有正确替代</option>
+          <label id="reference-filter" hidden>GT 对照<select id="gold">
+            <option value="all">全部样本</option><option value="miss">有更贴近 GT 的候选</option>
+            <option value="hit">择优命中最近候选</option>
+            <optgroup id="benchmark-filters" label="基线评测"><option value="error">Paddle 有误</option>
+            <option value="repairable">有正确替代</option></optgroup>
           </select></label>
+          <button id="clear-filters" type="button">清除筛选</button>
         </details>
+        <button id="bulk" hidden></button><button id="undo" hidden>撤销上次批量通过</button>
       </div>
       <div id="queue-list" class="queue-list"></div>
     </aside>
@@ -73,7 +87,9 @@
   </div>
   <main id="overview" class="overview" hidden></main>
   <main id="settings" class="settings" hidden>
-    <header class="settings-heading"><div><h2>识别流程与阈值</h2><p>沿着同一块裁图，查看模型如何识别、评分和筛选难例。</p></div>
+    <header class="settings-heading"><h2>工作台设置</h2>
+      <details id="runtime" class="export-menu" hidden><summary id="runtime-summary">模型后台</summary>
+        <div id="runtime-detail"></div></details>
       <span id="settings-batch"></span></header>
     <section class="deployment-settings panel">
       <div><h3>模型部署</h3><p>串行按需模式一次加载一个模型，批次结束后释放。后台并行常驻模式同时启动已启用的模型，供命令行重复调用。</p></div>
@@ -86,6 +102,7 @@
       </form>
       <p id="deployment-status" role="status"></p>
     </section>
+    <details class="settings-rules"><summary>筛选规则与阈值</summary>
     <section class="flow-sheet" aria-label="识别与难例筛选流程">
       <div class="flow-unit"><h3>版面与裁图</h3><div class="flow-tile"><strong>PDF / 图片</strong><span>Paddle 版面检测</span><b>文字或表格裁图</b></div></div>
       <span class="flow-arrow" aria-hidden="true">→</span>
@@ -113,10 +130,8 @@
         <button id="reset-policy">恢复运行时阈值</button></div>
       </section>
     </div>
+    </details>
   </main>
-  <dialog id="import-dialog"><div class="dialog-bar"><strong>导入已完成的批次</strong><form method="dialog"><button>关闭</button></form></div>
-    <div class="import-body"><p id="import-root"></p><select id="import-list" aria-label="结果批次"></select>
-    <button id="import-submit" class="primary">导入并查看</button><p id="import-message" role="status"></p></div></dialog>
   <dialog id="image-dialog">
     <div class="dialog-bar"><strong id="dialog-title"></strong>
       <div class="dialog-actions"><button type="button" id="img-minus" aria-label="缩小">−</button><button id="img-plus" aria-label="放大">＋</button><button id="img-fit">适宽</button><button id="img-native">原始像素</button><button id="img-full">全屏</button><button id="draw-location" hidden>手动画框</button>
@@ -143,8 +158,8 @@
     <div id="table-dialog-content"></div>
     <div id="cell-detail" aria-live="polite"></div>
     <div class="table-review-actions"><span id="table-feedback" role="status"></span>
-      <button type="button" id="table-reject">Not pass</button>
-      <button type="button" id="table-pass" class="primary">Pass</button>
+      <button type="button" id="table-reject">驳回</button>
+      <button type="button" id="table-pass" class="primary">确认通过</button>
     </div>
   </dialog>
 </body>

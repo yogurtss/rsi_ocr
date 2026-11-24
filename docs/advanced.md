@@ -133,3 +133,5 @@ rsi-ocr evaluate runs/omni-pilot/benchmark/evidence.jsonl \
 抽样按文档类型分层，`--table-pages` 为表格页预留名额。省略 `--regions-per-task` 可跑所选页面的全部区域。标注和页面来自固定版本的 OmniDocBench。按可识别的文件名前缀分组，匿名页沿用各自的页面标识。标注裁图的文字 CER、数字一致性、表格规范化 TEDS/TEDS-S 和数字单元格准确率用于区域识别对比。表格先用本项目的解析器统一成单元格树，分数适用于同批区域比较。参考标注单独写入 `references.jsonl`，评测样本标记为 `benchmark` 并排除在训练导出之外。先在 `calibration` 分区核对阈值，再看 `holdout`。评测报告在同一审核预算下比较均匀抽样、教师最大分歧和完整挖掘排序。[OmniDocBench](https://huggingface.co/datasets/opendatalab/OmniDocBench)
 
 需要验证 Paddle 原页采集时，给 `run_local.py` 追加 `--pages runs/omni-pilot/input/pages.jsonl`，结果写入 `capture/` 与 `production/`。真实裁图可在质控页面回放。工作台优先使用已记录的区域框。对缺少坐标的历史裁图，只有与原页高相似度且唯一匹配时才显示定位框。日志按服务写入输出目录，在同一目录用 `--stage paddle|oxr|ovis|jev` 可重跑指定服务。
+
+给普通生产批次做事后评测时，将 `evaluate` 的输入换为该批次的 `production/evidence.jsonl` 和区域参考标注文件，指定 `--partition all` 即可评测没有分区标记的数据。`cases.jsonl` 的 `selection_gt` 给出自动选择、最近候选（含并列）及双方的 CER 或 TEDS。`report.json` 汇总具有参考标注的区域数、可比较区域数和命中数。无自动结果的区域也会列在逐例报告中。

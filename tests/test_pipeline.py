@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from rsi_ocr.capture import Recorder, capture_gpu_pages, capture_pages
 from rsi_ocr.config import load_config
 from rsi_ocr.formats import table_cells, table_otsl
-from rsi_ocr.mining import mine
+from rsi_ocr.mining import choose_transcription, mine
 from rsi_ocr.reward import score
 from rsi_ocr.service import Service
 from rsi_ocr.store import digest, read_rows, write_rows
@@ -246,6 +246,12 @@ class PipelineTest(unittest.TestCase):
             mine(self.config, region_file, output)
             self.assertEqual(upstream.call_count, calls + 1)
         self.assertEqual(summary["scanned"], 2)
+        results = {row["task"]: row for row in read_rows(output / "selected.jsonl")}
+        self.assertEqual((results["text"]["model_alias"], results["text"]["label"]), ("oxr", "Total 001"))
+        self.assertEqual(results["text"]["status"], "selected")
+        self.assertAlmostEqual(results["text"]["margin"], 0.9)
+        self.assertEqual(results["table"]["status"], "unavailable")
+        self.assertIsNone(results["table"]["label"])
         rows = {row["task"]: row for row in read_rows(output / "review.jsonl")}
         self.assertIn("numeric_conflict", rows["text"]["reasons"])
         self.assertTrue(rows["text"]["proposals"][0]["recommended"])
@@ -370,3 +376,22 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(set(row["models"]), {"paddle"})
         self.assertEqual(row["models"]["paddle"]["raw"], "Paddle output")
         self.assertIsNone(row["priority"])
+        result, = read_rows(output / "selected.jsonl")
+        self.assertEqual(result["label"], "Paddle output")
+        self.assertEqual(result["reasons"], ["judge_disabled"])
+
+    def test_selection_compares_distinct_transcripts_in_policy_order(self):
+        def scored(label, value):
+            return {"status": "ok", "label": label, "judge": {"status": "scored", "prob_yes": value}}
+
+        policy = self.config["mining"]
+        models = {"ovis": scored("teacher", 0.98), "oxr": scored("teacher", 0.98), "paddle": scored("base", 0.97)}
+        chosen = choose_transcription(models, "paddle", policy)
+        self.assertEqual((chosen["model_alias"], chosen["margin"], chosen["reasons"]), ("oxr", 0.01, ["close_scores"]))
+        models["paddle"] = scored("base", 0.98)
+        self.assertEqual(choose_transcription(models, "paddle", policy)["model_alias"], "paddle")
+        models["paddle"] = scored("base", 0.1)
+        models["ovis"]["judge"] = {"status": "render_error", "prob_yes": 1.0}
+        self.assertEqual(choose_transcription(models, "paddle", policy)["reasons"], ["partial_scores"])
+        models["ovis"]["judge"]["status"] = "precheck_reject"
+        self.assertEqual(choose_transcription(models, "paddle", policy)["status"], "selected")

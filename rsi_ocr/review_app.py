@@ -10,15 +10,17 @@ from uuid import uuid4
 from contextlib import closing
 from datetime import datetime, timezone
 from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from rsi_ocr.mining import FIXED_RULES, classify, select
+from rsi_ocr.benchmark import reference_comparison, reference_metrics, region_key, selection_summary
+from rsi_ocr.mining import FIXED_RULES, choose_transcription, classify, select, selected_result
 from rsi_ocr.formats import table_cells, table_metrics
 from rsi_ocr.store import digest, json_text, read_rows, write_rows
 from rsi_ocr.training import paddle_sft_record
@@ -57,7 +59,7 @@ def decision_record(row, status, alias):
               "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds")}
     if status == "approved":
         if not label:
-            raise ValueError("请选择一条可用的模型转录，再点 Pass")
+            raise ValueError("请选择一条可用的模型转录，再点「确认通过」")
         image = verified_image(row, record)
         if row.get("split", "mine") in SFT_SPLITS:
             record["sft"] = paddle_sft_record(image, row["task"], label)
@@ -143,16 +145,57 @@ def document(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+@lru_cache(maxsize=48)
+def page_thumbnail(path, mtime_ns):
+    with Image.open(path, formats=("JPEG", "PNG")) as page, BytesIO() as buffer:
+        page.thumbnail((560, 360), Image.Resampling.LANCZOS)
+        page.convert("RGB").save(buffer, "JPEG", quality=82)
+        return buffer.getvalue()
+
+
+def import_cover(run):
+    directory = run.parent / "input"
+    with (directory / "pages.jsonl").open(encoding="utf-8-sig") as stream:
+        first = json.loads(stream.readline())
+    image = (directory / first["image"]).resolve()
+    cover = image if image.is_relative_to(run.parent.resolve() / "input" / "pages") and image.is_file() else None
+    return first.get("doc_id"), cover
+
+
 def read_batch(run, evaluation, title):
     pages = run.parent / "input" / "pages.jsonl"
     sources = Counter(row["doc_id"] for row in read_rows(pages)) if pages.is_file() else {}
+    summary = document(run / "summary.json")
+    rows = {}
+    for row in read_rows(run / "evidence.jsonl"):
+        if "selection" not in row:
+            row["selection"] = choose_transcription(row["models"], row["target_alias"], summary["mining"])
+        rows[row["case_id"]] = row
+    details = {}
+    references_path = pages.with_name("references.jsonl")
+    if evaluation:
+        details = {item["case_id"]: item for item in read_rows(evaluation / "cases.jsonl") if item["case_id"] in rows}
+    elif references_path.is_file():
+        by_region = {region_key(row): row for row in rows.values()}
+        with references_path.open(encoding="utf-8-sig") as stream:
+            for line in stream:
+                try:
+                    ref = json.loads(line)
+                    row = by_region.get(region_key(ref))
+                    reference = ref["reference"]
+                    if not row or ref.get("image_sha256") != row["image_sha256"] or not isinstance(reference, str) or not reference.strip():
+                        continue
+                    details[row["case_id"]] = {"reference": reference, "models": reference_metrics(row, reference)}
+                except (KeyError, TypeError, ValueError):
+                    continue
+    for case_id, detail in details.items():
+        detail["selection_gt"] = reference_comparison(rows[case_id], detail["models"])
     return {
         "sources": sources,
         "title": title, "path": run.resolve(),
-        "summary": document(run / "summary.json"),
-        "rows": {row["case_id"]: row for row in read_rows(run / "evidence.jsonl")},
+        "summary": summary, "rows": rows,
         "queue": {row["case_id"] for row in read_rows(run / "review.jsonl")},
-        "details": {row["case_id"]: row for row in read_rows(evaluation / "cases.jsonl")} if evaluation else {},
+        "details": details, "selection_gt": selection_summary([item["selection_gt"] for item in details.values()]),
         "report": document(evaluation / "report.json") if evaluation else None,
     }
 
@@ -354,7 +397,31 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
 
     @app.get("/api/imports")
     def list_imports():
-        return {"directory": str(library or ""), "names": list(available_runs())}
+        runs = available_runs()
+        items = []
+        for name, path in runs.items():
+            item = {"name": name}
+            try:
+                item["regions"] = document(path / "summary.json").get("scanned")
+                item["first_doc"], cover = import_cover(path)
+                item["has_cover"] = cover is not None
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                pass
+            items.append(item)
+        return {"directory": str(library or ""), "names": list(runs), "batches": items}
+
+    @app.get("/api/imports/{name}/cover")
+    def batch_cover(name: str):
+        run = available_runs().get(name)
+        if run:
+            try:
+                _, cover = import_cover(run)
+                if cover:
+                    return Response(page_thumbnail(cover, cover.stat().st_mtime_ns), media_type="image/jpeg",
+                                    headers={"Cache-Control": "private, max-age=3600"})
+            except (OSError, ValueError, KeyError, TypeError, Image.DecompressionBombError):
+                pass
+        raise HTTPException(404, "批次没有可用的首页预览")
 
     @app.post("/api/imports/{name}")
     def import_batch(name: str):
@@ -380,18 +447,22 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         for case_id, row in batch["rows"].items():
             target = row["models"][row["target_alias"]]
             detail = batch["details"].get(case_id, {})
+            comparison = detail.get("selection_gt", {})
             rows.append({
                 **{key: row.get(key) for key in
                    ("case_id", "doc_id", "page_id", "region_id", "task", "priority", "reasons", "audit_sample", "hard_case")},
                 "operational": bool(row.get("target_operational_error")),
                 "valid_target": bool(target.get("label")),
+                "selection_status": row["selection"]["status"],
                 "queued": case_id in batch["queue"], "judge_status": target.get("judge", {}).get("status"),
                 "review_status": recorded.get(case_id, {}).get("status", "pending"),
                 "target_error": detail.get("target_error"), "repairable": detail.get("repairable"),
+                "gt_closest": comparison.get("is_closest") if comparison.get("valid_candidates", 0) >= 2 else None,
                 "exportable": row.get("split", "mine") in SFT_SPLITS,
                 "split": row.get("split", "mine"),
             })
         return {"rows": rows, "summary": batch["summary"], "report": batch["report"], "sources": batch["sources"],
+                "selection_gt": batch["selection_gt"],
                 "original_thresholds": threshold_values(original_batch(batch_id)["summary"]["mining"])}
 
     @app.post("/api/batches/{batch_id}/bulk")
@@ -408,10 +479,10 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                     continue
                 if db.execute("SELECT 1 FROM decisions WHERE case_id=?", (key,)).fetchone():
                     continue
-                if not row["models"][row["target_alias"]].get("label"):
+                if row["selection"]["status"] != "selected":
                     continue
                 try:
-                    record = decision_record(row, "approved", row["target_alias"])
+                    record = decision_record(row, "approved", row["selection"]["model_alias"])
                 except (ValueError, OSError) as error:
                     raise HTTPException(422, str(error)) from error
                 record.update(source="bulk_approved", bulk_id=token)
@@ -456,7 +527,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
             saved_location = db.execute("SELECT payload FROM review_locations WHERE case_id = ?", (case_id,)).fetchone()
         manual_box = json.loads(saved_location[0])["box"] if saved_location else None
         return {
-            **row, "metrics": detail.get("models", {}), "reference": reference,
+            **row, "metrics": detail.get("models", {}), "reference": reference, "selection_gt": detail.get("selection_gt"),
             "reference_view": output_view(reference, None, row["task"]), "views": views,
             "baseline_views": baseline_views,
             "has_crop": Path(row["image"]).is_file(),
@@ -498,6 +569,13 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
             db.execute("INSERT INTO review_locations VALUES (?, ?) ON CONFLICT(case_id) DO UPDATE SET payload=excluded.payload",
                        (case_id, json_text(record)))
         return geometry
+
+    @app.get("/api/batches/{batch_id}/export/selected")
+    def export_selected(batch_id: str):
+        batch = original_batch(batch_id)
+        return StreamingResponse((json_text(selected_result(row)) + "\n" for row in batch["rows"].values()),
+                                 media_type="application/x-ndjson",
+                                 headers={"Content-Disposition": 'attachment; filename="selected.jsonl"'})
 
     @app.get("/api/batches/{batch_id}/export/review")
     def export_decisions(batch_id: str):

@@ -21,7 +21,8 @@ mining:
   audit_rate: 0.10               # 全量样本随机抽检比例
   review_per_document: 30       # 每文档、每任务的难例入队上限
   review_per_task: {text: 300, table: 300}  # 本批每种任务的难例配额
-  proposal_judge: 0.90          # 推荐候选所需的最低 Jev 分
+  proposal_judge: 0.90          # 推荐候选和自动择优通过质量筛查所需的最低 Jev 分
+  selection_margin: 0.05        # 最高分与不同转录的次高分差低于此值时标记待核对
   proposal_families: 2          # 推荐候选所需的一致模型家族数
 
 # GlyphStack 终端后台。run 只需后台端口；省略输入路径时处理此目录。
