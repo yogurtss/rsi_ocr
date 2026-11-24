@@ -1,4 +1,5 @@
 """Rich renderables for the model console and attached monitors."""
+import re
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -66,17 +67,37 @@ def model_card(alias, index, spec, selected, requests, frame, now, spacious):
                  padding=(0, 1))
 
 
-def layout_card(layout, height):
-    device, _, index = layout["device"].partition(":")
-    hardware = Text(f"GPU {index}" if device == "gpu" else "CPU", style="bright_green",
-                    no_wrap=True, overflow="ellipsis")
+def layout_device_label(device):
+    kind, _, index = device.partition(":")
+    return f"GPU {index}" if kind == "gpu" else "CPU"
+
+
+def layout_card(layout, runtime, height, cached=False):
+    configured = layout["device"]
+    device = runtime.get("device")
+    status = runtime.get("status")
+    fallback = bool(device == "cpu" and configured.startswith("gpu:"))
+    if device:
+        prefix = "实际" if status == "running" else "上次"
+        summary = f"{prefix} {layout_device_label(device)}" + (" · 回退" if fallback else "")
+    elif cached:
+        summary = "整批复用 · 已跳过"
+    elif runtime.get("unverified"):
+        summary = "设备未核验"
+    else:
+        summary = {"running": "正在核验设备", "failed": "启动或检测失败"}.get(status, "设备未核验")
+    color = "red" if status == "failed" else "yellow" if fallback else "bright_green" if device else "dim"
+    actual = Text(summary, style=color, no_wrap=True, overflow="ellipsis")
+    hardware = Text(f"配置 {layout_device_label(configured)}", no_wrap=True, overflow="ellipsis")
     weights = Text(layout["path"], style="dim", no_wrap=True, overflow="ellipsis")
     if height == 3:
-        hardware.append("  ·  ")
-        hardware.append_text(weights)
-        content = hardware
+        actual.append("  ·  ")
+        actual.append_text(hardware)
+        actual.append("  ·  ")
+        actual.append_text(weights)
+        content = actual
     else:
-        content = Group(hardware, weights)
+        content = Group(actual, hardware, weights)
     return Panel(content, title="版面检测", title_align="left", border_style="grey50", box=box.ROUNDED,
                  padding=(0, 1), height=height)
 
@@ -121,12 +142,28 @@ def log_panel(entries, rows):
                  height=rows + 2)
 
 
-def console_view(snap, selected, message, expanded, width, height, now, frame):
+def model_log_panel(alias, entries, rows):
+    lines = []
+    for entry in entries[-rows:]:
+        plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", entry)
+        plain = "".join(char if char.isprintable() else " " for char in plain)
+        lines.append(Text(plain, no_wrap=True, overflow="ellipsis"))
+    if not lines:
+        lines.append(Text("等待 vLLM 输出", style="dim", no_wrap=True, overflow="ellipsis"))
+    return Panel(Group(*lines), title=f"vLLM 日志 · {alias}", title_align="left", border_style="cyan",
+                 box=box.ROUNDED, height=rows + 2)
+
+
+def console_view(snap, selected, message, expanded, width, height, now, frame, model_log=None):
     requests = snap.get("requests", [])
     logs = snap.get("logs", [])
     if height <= 5:
-        return log_panel(logs, max(1, height - 2))
+        rows = max(1, height - 2)
+        return log_panel(logs, rows) if model_log is None else model_log_panel(selected, model_log, rows)
     layout = snap.get("layout")
+    layout_runtime = snap.get("layout_runtime", {})
+    capture = snap.get("capture_progress")
+    skipped = bool(capture and capture["reused"] == capture["total"])
     layout_in_grid = bool(layout and width >= 125)
     columns = 5 if layout_in_grid else 4 if width >= 100 else 2
     spacious = height >= 30
@@ -137,7 +174,7 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
     cards = [model_card(alias, i, spec, alias == selected, requests, frame, now, spacious)
              for i, (alias, spec) in enumerate(snap["models"].items(), 1)]
     if layout_in_grid:
-        cards.append(layout_card(layout, card_height))
+        cards.append(layout_card(layout, layout_runtime, card_height, skipped))
     for i in range(0, len(cards), columns):
         grid.add_row(*cards[i:i + columns])
     active = [j for j in snap["jobs"] if j["status"] in {"running", "queued"}]
@@ -148,7 +185,7 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
     header.append(f"   {len(active)} 项任务", style="cyan")
     controls = Text(no_wrap=True, overflow="ellipsis")
     for key, action in (("1–4", "选卡"), ("C", "并发"), ("S", "启动"), ("X", "停止"), ("A", "全停"), ("T", "↻ 重启"),
-                        ("R", "运行"), ("P", "请求视图"), ("^C", "退出")):
+                        ("R", "运行"), ("L", "vLLM"), ("P", "POST"), ("^C", "退出")):
         controls.append(f" {key} ", style="bold black on bright_cyan" if key == "T" else "bold cyan")
         controls.append(action + " ")
     jobs = Table.grid(expand=True, padding=(0, 1))
@@ -170,9 +207,30 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
         visible.append(grid)
         remaining -= grid_height
         if layout and not layout_in_grid and remaining >= 6:
-            visible.append(layout_card(layout, 3))
+            visible.append(layout_card(layout, layout_runtime, 3, skipped))
             remaining -= 3
     visible.append(controls)
+    if capture and remaining >= 5 and not expanded:
+        total, reused, done = capture["total"], capture["reused"], capture["done"]
+        detail = f"Paddle · 复用 {reused} 页 · 新完成 {done} 页 · 剩余 {total - reused - done} 页"
+        if capture.get("layout_page") and capture.get("ocr_page"):
+            detail += f" · 版面 {capture['layout_page']} · OCR {capture['ocr_page']}"
+        elif capture.get("current"):
+            detail += f" · {capture.get('phase', '')} · {capture['current']}"
+        if remaining >= 7:
+            path = "PaddleOCR-VL → vLLM · " + capture.get("mode", "检查断点")
+            last = capture.get("last_page") or {}
+            if last:
+                path += f" · 上一完成页 {last['seconds']:.1f}s"
+                if last.get("layout_reused"):
+                    path += " · 版面已复用"
+                elif "layout_seconds" in last:
+                    path += f" · 版面 {last['layout_seconds']:.2f}s"
+                path += f" · vLLM 请求 {last['request_seconds']:.1f}s"
+            visible.append(Text(path, style="dim", no_wrap=True, overflow="ellipsis"))
+            remaining -= 1
+        visible.append(Text(detail, style="bright_cyan", no_wrap=True, overflow="ellipsis"))
+        remaining -= 1
     job_height = max(1, len(recent_jobs)) + 2
     if not expanded:
         if remaining >= job_height + 9:
@@ -185,12 +243,26 @@ def console_view(snap, selected, message, expanded, width, height, now, frame):
             visible.append(Text(summary, style=color, no_wrap=True, overflow="ellipsis"))
             remaining -= 1
     log_target = (8 if spacious else 5) if expanded else max(10, (remaining * 2 + 2) // 3)
-    log_height = min(log_target, max(3, remaining - 3))
+    min_log_height = 6 if model_log is not None and width < 100 and remaining >= 6 else 3
+    log_height = min(max(min_log_height, log_target), max(min_log_height, remaining - 3))
     if remaining - log_height >= 3:
         visible.append(traffic_panel(requests, remaining - log_height - 2, now, frame))
     else:
         log_height = remaining
     footer = message or snap["models"][selected]["detail"] or snap.get("config_path") or snap["input_path"]
     visible.append(Text(footer, style="yellow" if message else "dim", no_wrap=True, overflow="ellipsis"))
-    visible.append(log_panel(logs, log_height - 2))
+    if model_log is None:
+        visible.append(log_panel(logs, log_height - 2))
+    elif width >= 100:
+        log_grid = Table.grid(expand=True, padding=(0, 1))
+        log_grid.add_column(ratio=1)
+        log_grid.add_column(ratio=1)
+        log_grid.add_row(log_panel(logs, log_height - 2), model_log_panel(selected, model_log, log_height - 2))
+        visible.append(log_grid)
+    elif log_height >= 6:
+        model_height = log_height // 2
+        visible.extend([log_panel(logs, log_height - model_height - 2),
+                        model_log_panel(selected, model_log, model_height - 2)])
+    else:
+        visible.append(model_log_panel(selected, model_log, log_height - 2))
     return Group(*visible)

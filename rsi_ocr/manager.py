@@ -38,6 +38,8 @@ class Manager:
         self.root = Path(settings["output_root"]).resolve()
         self.default_input = Path(settings.get("input_path", "data/inbox")).resolve()
         self.config = local_config(settings, base)
+        self.layout_runtime = {"status": "idle", "device": None}
+        self.capture_progress = {}
         self.base = base
         self.policy = self.config["mining"]
         apply_model_selection(self.config, self.policy)
@@ -48,6 +50,7 @@ class Manager:
         self.journal_path = None
         self.lock = RLock()
         self.logs = deque(maxlen=128)
+        self.model_logs = {}
         self.log_sink = log_sink
         self.closing = Event()
         self.closed = Event()
@@ -92,9 +95,14 @@ class Manager:
                 self.config["models"][alias] = spec
                 self.models[alias].update(self.card(spec), detail="")
             if "paddle" in replacements:
-                self.config["capture"] = config["capture"]
-                self.config["layout"] = config["layout"]
+                self.apply_capture_config(config)
             apply_model_selection(self.config, self.policy)
+
+    def apply_capture_config(self, config):
+        if self.config["capture"] != config["capture"]:
+            self.layout_runtime = {"status": "idle", "device": None}
+        self.config["capture"] = config["capture"]
+        self.config["layout"] = config["layout"]
 
     def start(self):
         self.journal_dir = TemporaryDirectory(prefix="glyphstack-")
@@ -131,6 +139,36 @@ class Manager:
         self.check_closing()
         self.log(message)
 
+    def report_capture_page(self, state):
+        with self.lock:
+            last = self.capture_progress.get("last_page")
+            if "seconds" in state:
+                last = {key: state[key] for key in ("seconds", "request_seconds", "layout_seconds", "layout_reused")
+                        if key in state}
+            self.capture_progress = {**state, "last_page": last}
+
+    def report_layout_device(self, device):
+        with self.lock:
+            self.layout_runtime["device"] = device
+            configured = self.config["layout"]["device"]
+            if device is None:
+                self.layout_runtime["unverified"] = True
+                self.log(f"版面检测设备未核验 · 配置 {configured}")
+            else:
+                self.log(f"版面检测设备 · 实际 {device} · 配置 {configured}")
+
+    @contextmanager
+    def layout_session(self):
+        with self.lock:
+            self.layout_runtime = {"status": "running", "device": None}
+        completed = False
+        try:
+            yield self.report_layout_device
+            completed = True
+        finally:
+            with self.lock:
+                self.layout_runtime["status"] = "done" if completed else "failed"
+
     def snapshot(self):
         with self.lock:
             requests = recent(self.journal_path)
@@ -140,6 +178,10 @@ class Manager:
                     "config_path": str(self.config_path or ""),
                     "service": "pageproof", "mode": self.mode, "port": self.port, "studio_port": self.settings["port"],
                     "layout": self.config["layout"].copy(), "layout_device": self.config["layout"]["device"],
+                    "layout_runtime": self.layout_runtime.copy(),
+                    "capture_progress": self.capture_progress.copy(),
+                    "capture_queues": self.config["capture"].get("predict", {}).get("use_queues",
+                                      self.config["capture"].get("pipeline", {}).get("use_queues", True)),
                     "output_root": str(self.root), "input_path": str(self.default_input),
                     "models": {k: v.copy() for k, v in self.models.items()},
                     "jobs": [v.copy() for v in finished[-25:] + active]}
@@ -180,6 +222,25 @@ class Manager:
             self.logs.append({"time": time(), "message": message, "error": error})
         if self.log_sink:
             self.log_sink(message)
+
+    def model_log_tail(self, alias):
+        with self.lock:
+            if alias not in self.models:
+                raise ValueError("未知模型")
+            path = self.model_logs.get(alias)
+        if path is None:
+            return []
+        try:
+            with path.open("rb") as stream:
+                size = stream.seek(0, 2)
+                offset = max(0, size - 64 * 1024)
+                stream.seek(offset)
+                text = stream.read(size - offset).decode("utf-8", errors="replace")
+        except FileNotFoundError:
+            return []
+        if offset:
+            text = text.partition("\n")[2]
+        return text.splitlines()[-64:]
 
     def update_job(self, job, **values):
         with self.lock:
@@ -294,8 +355,7 @@ class Manager:
                 spec = config["models"][alias]
                 self.config["models"][alias] = spec
                 self.models[alias].update(self.card(spec), detail="")
-            self.config["capture"] = config["capture"]
-            self.config["layout"] = config["layout"]
+            self.apply_capture_config(config)
             apply_model_selection(self.config, self.policy)
             self.apply_mode(mode)
 
@@ -341,7 +401,9 @@ class Manager:
             self.unload(alias)
         with self.lock:
             self.check_closing()
-            self.models[alias].update(status="starting", detail=str(output / (alias + ".log")))
+            path = output / (alias + ".log")
+            self.model_logs[alias] = path
+            self.models[alias].update(status="starting", detail=str(path))
             self.log(f"正在加载模型 · {alias} · GPU {self.models[alias]['gpu']}")
         try:
             with ExitStack() as stack:
@@ -372,6 +434,9 @@ class Manager:
                         self.models[alias].update(status="healthy" if ok else "unhealthy", load=load)
 
     def infer(self, job):
+        with self.lock:
+            self.capture_progress = {}
+            self.layout_runtime = {"status": "idle", "device": None}
         if self.mode == "managed":
             missing = [alias for alias in mining_models(self.config["mining"]) if not self.is_ready(alias)]
             if missing:
@@ -379,11 +444,10 @@ class Manager:
         source = Path(job["value"])
         self.update_job(job, stage="检查输入与续跑进度")
         with resume_batch(self.root, source, self.settings, self.check_closing) as (output, resumed, signatures):
-            if resumed:
-                self.log(f"续跑批次 · {output}")
+            self.log(f"{'续跑' if resumed else '新建'}批次 · {output}")
             self.update_job(job, output=str(output), stage="导入页面")
             pages = render_pages(source, output / "input", self.settings, progress=self.report_progress,
-                                 reuse_existing=resumed, signatures=signatures)
+                                 reuse_existing=resumed, signatures=signatures, streaming=True, check_cancelled=self.check_closing)
             self.infer_pages(job, output, pages)
 
     def infer_pages(self, job, output, pages):
@@ -405,7 +469,8 @@ class Manager:
 
             def stage(alias):
                 run_local(config, output, jobs, pages, stage=alias, session=lambda *_: nullcontext(),
-                          progress=self.report_progress, check_cancelled=self.check_closing)
+                          progress=self.report_progress, check_cancelled=self.check_closing,
+                          layout_session=self.layout_session, report_page=self.report_capture_page)
 
             self.update_job(job, stage="版面与基线识别")
             stage(policy["target"])
@@ -418,7 +483,8 @@ class Manager:
             return
         try:
             run_local(config, output, jobs, pages,
-                      session=use_model, progress=self.report_progress, check_cancelled=self.check_closing)
+                      session=use_model, progress=self.report_progress, check_cancelled=self.check_closing,
+                      layout_session=self.layout_session, report_page=self.report_capture_page)
         finally:
             self.unload_all()
 
@@ -517,7 +583,8 @@ def manager_app(manager, terminal=None):
 
     @app.middleware("http")
     async def local_client(request: Request, call_next):
-        if request.method == "POST" and request.headers.get("X-PageProof-Client") != "cli":
+        needs_client = request.method == "POST" or request.url.path.startswith("/model-logs/")
+        if needs_client and request.headers.get("X-PageProof-Client") != "cli":
             return JSONResponse({"detail": "请使用本机 GlyphStack 客户端"}, status_code=403)
         return await call_next(request)
 
@@ -526,6 +593,15 @@ def manager_app(manager, terminal=None):
     @app.get("/status")
     def status():
         return manager.snapshot()
+
+    @app.get("/model-logs/{alias}")
+    def model_logs(alias: str):
+        try:
+            return manager.model_log_tail(alias)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+        except OSError as error:
+            raise HTTPException(503, str(error)) from error
 
     @app.get("/jobs/{job_id}")
     def job_status(job_id: str):

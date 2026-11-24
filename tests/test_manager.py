@@ -55,6 +55,8 @@ class ManagerTests(unittest.TestCase):
         @contextmanager
         def session(config, alias, output, cancelled):
             events.append(("start", alias))
+            if alias == "oxr":
+                (output / "oxr.log").write_text(("旧日志\n" * 12000) + "vLLM 启动\n", encoding="utf-8")
             try:
                 yield [Mock(poll=lambda: None)]
             finally:
@@ -72,6 +74,7 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(jev["sidecars"]["render"]["argv"][-2:], ["19211", jev["engine_url"]])
             manager.start()
             try:
+                self.assertEqual(manager.model_log_tail("oxr"), [])
                 manager.enqueue("start", "paddle")
                 manager.enqueue("start", "paddle")
                 manager.enqueue("start", "oxr")
@@ -87,6 +90,12 @@ class ManagerTests(unittest.TestCase):
                 self.assertLess(logs.index("正在加载模型 · paddle · GPU 0"), logs.index("模型已就绪 · paddle"))
                 self.assertIn("模型已就绪 · 复用 paddle", logs)
                 self.assertIn("模型已卸载 · oxr", logs)
+                model_lines = manager.model_log_tail("oxr")
+                self.assertEqual(len(model_lines), 64)
+                self.assertEqual(model_lines[-1], "vLLM 启动")
+                with (Path(temp) / ".manager/oxr.log").open("a", encoding="utf-8") as stream:
+                    stream.write("vLLM 新一行\n")
+                self.assertEqual(manager.model_log_tail("oxr")[-1], "vLLM 新一行")
             finally:
                 manager.close()
 
@@ -171,9 +180,13 @@ class ManagerTests(unittest.TestCase):
         stages = []
         teachers = Barrier(2)
 
-        def run_stage(*args, stage, session, progress, check_cancelled):
+        def run_stage(*args, stage, session, progress, check_cancelled, layout_session, report_page):
             stages.append(stage)
             progress(f"执行 {stage}")
+            if stage == "paddle":
+                with layout_session() as report_device:
+                    report_device("gpu:2")
+                    self.assertEqual(manager.snapshot()["layout_runtime"], {"status": "running", "device": "gpu:2"})
             if stage in {"oxr", "ovis"}:
                 teachers.wait(timeout=2)
 
@@ -193,6 +206,7 @@ class ManagerTests(unittest.TestCase):
                 self.assertEqual(stages[0], "paddle")
                 self.assertEqual(set(stages[1:-1]), {"oxr", "ovis"})
                 self.assertEqual(stages[-1], "jev")
+                self.assertEqual(manager.snapshot()["layout_runtime"], {"status": "done", "device": "gpu:2"})
                 self.assertIn("执行 jev", [entry["message"] for entry in manager.snapshot()["logs"]])
                 unload.assert_not_called()
 

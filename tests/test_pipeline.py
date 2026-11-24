@@ -3,10 +3,10 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from types import ModuleType
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 from rsi_ocr.capture import Recorder, capture_gpu_pages, capture_pages
 from rsi_ocr.config import load_config
@@ -27,11 +27,13 @@ def chat(text, finish="stop"):
     return {"choices": [{"message": {"content": text}, "finish_reason": finish}]}
 
 
-def fake_gpu_capture_worker(config, manifest, root, messages):
+def fake_gpu_capture_worker(config, manifest, root, messages, plan=None):
     with messages:
         device = config["capture"]["pipeline"]["device"]
         write_rows(root / "regions.jsonl", [{"device": device}])
         messages.send(("progress", device))
+        messages.send(("device", "cpu"))
+        messages.send(("page", {"current": "d · 第 2 页"}))
 
 
 class PipelineTest(unittest.TestCase):
@@ -60,7 +62,15 @@ class PipelineTest(unittest.TestCase):
 
     def test_capture_records_unchanged_crop_and_resumes(self):
         self.config["capture"]["pipeline"]["pipeline_version"] = "v1.6"
+        self.config["capture"]["pipeline"]["device"] = "gpu:2"
         module = ModuleType("paddleocr")
+        paddle = ModuleType("paddle")
+        paddle.is_compiled_with_cuda = lambda: True
+
+        def create_predictor(config):
+            return object()
+
+        paddle.inference = SimpleNamespace(create_predictor=create_predictor)
         test = self
 
         @contextmanager
@@ -71,6 +81,11 @@ class PipelineTest(unittest.TestCase):
         class PaddlePipeline:
             def __init__(self, **options):
                 self.url = options["vl_rec_server_url"]
+                test.assertEqual(options["device"], "gpu:2")
+                detector = paddle.inference.create_predictor(SimpleNamespace(use_gpu=lambda: False))
+                self.paddlex_pipeline = SimpleNamespace(
+                    layout_det_model=SimpleNamespace(runner=SimpleNamespace(predictor=detector))
+                )
 
             def predict_iter(self, page, **options):
                 test.assertTrue(options["use_layout_detection"])
@@ -84,25 +99,115 @@ class PipelineTest(unittest.TestCase):
         module.PaddleOCRVL = PaddlePipeline
         pages = self.root / "pages.jsonl"
         write_rows(pages, [{"doc_id": "d", "page_id": 0, "image": "block.png"}])
-        with (patch.dict("sys.modules", {"paddleocr": module}), patch.object(Recorder, "listen", local_transport),
+        with (patch.dict("sys.modules", {"paddleocr": module, "paddle": paddle}), patch.object(Recorder, "listen", local_transport),
               patch.object(Service, "request", return_value=chat("raw OCR")) as upstream):
-            path = capture_pages(self.config, pages, self.root / "capture")
+            devices = []
+            path = capture_pages(self.config, pages, self.root / "capture", report_device=devices.append)
             progress = []
-            capture_pages(self.config, pages, self.root / "capture", progress=progress.append)
+            capture_pages(self.config, pages, self.root / "capture", progress=progress.append, report_device=devices.append)
             upstream.assert_called_once()
-        self.assertEqual(progress, ["初始化 PaddleOCR 版面识别", "复用 OCR · 第 1/1 页 · 文件 1/1 · d"])
+        self.assertEqual(progress, ["版面与 OCR · 复用 1/1 页"])
+        self.assertEqual(devices, ["cpu"])
+        self.assertIs(paddle.inference.create_predictor, create_predictor)
         row, = read_rows(path)
         self.assertEqual((path.parent / row["image"]).read_bytes(), PNG)
         self.assertEqual(row["target"]["raw"], "raw OCR")
         self.assertEqual(row["target"]["parameters"], {"max_tokens": 200})
 
+    def test_restart_after_layout_then_reuse_completed_batch(self):
+        from rsi_ocr.local import run_local
+
+        batch = self.root / "batch"
+        manifest = batch / "input/pages.jsonl"
+        pages = [{"doc_id": "scan.pdf", "page_id": i, "image": f"{i}.png"} for i in (1, 2)]
+        detections = []
+        interrupted = False
+
+        def make_input(batch_dir):
+            path = batch_dir / "input/pages.jsonl"
+            write_rows(path, pages)
+            for page in pages:
+                (path.parent / page["image"]).write_bytes(PNG)
+            return path
+
+        make_input(batch)
+        detector = SimpleNamespace()
+
+        def process(data):
+            detections.append(data.input_paths[0])
+            return {"input_img": data.instances, "input_path": data.input_paths,
+                    "page_index": [None], "boxes": [[{"coordinate": [0, 0, 1, 1]}]]}
+
+        detector.process = process
+        pipeline = SimpleNamespace(paddlex_pipeline=SimpleNamespace(layout_det_model=detector))
+
+        def predict(image, **kwargs):
+            nonlocal interrupted
+            name = Path(image).name
+            result = detector.process(SimpleNamespace(instances=[SimpleNamespace(shape=(2, 2, 3))],
+                                                      input_paths=[name], page_indexes=[None]))
+            self.assertEqual(result["boxes"][0][0]["coordinate"], [0, 0, 1, 1])
+            if name == "2.png" and not interrupted:
+                interrupted = True
+                raise RuntimeError("interrupted after layout")
+            payload = {"model": "paddleocr-vl", "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "OCR:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(PNG).decode()}},
+            ]}]}
+            self.assertEqual(self.recorder.forward("/chat/completions", payload)[0], 200)
+            yield {}
+
+        pipeline.predict_iter = predict
+        module = SimpleNamespace(PaddleOCRVL=Mock(return_value=pipeline))
+
+        @contextmanager
+        def transport(recorder):
+            self.recorder = recorder
+            yield "local-test"
+
+        def run(batch_dir, path, session):
+            regions = batch_dir / "capture/regions.jsonl"
+            run_local(self.config, batch_dir, [(regions, batch_dir / "production")], path,
+                      stage="paddle", session=session, progress=logs.append)
+            return list(read_rows(regions))
+
+        sessions = Mock(side_effect=lambda *_: nullcontext())
+        logs = []
+        with (patch.dict("sys.modules", {"paddleocr": module}), patch.object(Recorder, "listen", transport),
+              patch.object(Service, "request", return_value=chat("原始转录")) as calls):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                run(batch, manifest, sessions)
+            self.assertEqual(len(list((batch / "capture/layout_cache").glob("*.json"))), 2)
+            rows = run(batch, manifest, sessions)
+            self.assertTrue(any("从 scan.pdf 第 2 页继续" in log for log in logs))
+            self.assertTrue(any("复用本页版面断点" in log for log in logs))
+            self.assertEqual(detections, ["1.png", "2.png"])
+            self.assertEqual([row["page_id"] for row in rows], [1, 2])
+
+            new = self.root / "new"
+            path = make_input(new)
+            (new / ".previous-batch").write_text(batch.name)
+            restored = run(new, path, sessions)
+            self.assertEqual([row["target"] for row in restored], [row["target"] for row in rows])
+            for row in restored:
+                self.assertTrue(Path(row["page_image"]).is_relative_to(new))
+                self.assertEqual((new / "capture" / row["image"]).read_bytes(), PNG)
+            self.assertEqual(sessions.call_count, 2)
+            self.assertEqual(module.PaddleOCRVL.call_count, 2)
+            self.assertEqual(calls.call_count, 2)
+
     def test_gpu_capture_worker_reports_progress_and_exits(self):
         self.config["capture"]["pipeline"]["device"] = "gpu:2"
         progress = []
+        devices = []
         output = self.root / "capture"
+        page_updates = []
         with patch("rsi_ocr.capture._capture_gpu_worker", fake_gpu_capture_worker):
-            capture_gpu_pages(self.config, self.root / "pages.jsonl", output, progress=progress.append)
+            capture_gpu_pages(self.config, self.root / "pages.jsonl", output, progress=progress.append,
+                              report_device=devices.append, report_page=page_updates.append)
+        self.assertEqual(page_updates, [{"current": "d · 第 2 页"}])
         self.assertEqual(progress, ["gpu:2"])
+        self.assertEqual(devices, ["cpu"])
         self.assertEqual(list(read_rows(output / "regions.jsonl")), [{"device": "gpu:2"}])
 
     def test_mining_verdicts_audit_and_approved_exports(self):

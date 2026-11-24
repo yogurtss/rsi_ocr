@@ -8,8 +8,9 @@ import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
-from rsi_ocr.capture import capture_gpu_pages, capture_pages
+from rsi_ocr.capture import capture_gpu_pages, capture_pages, capture_plan
 from rsi_ocr.config import load_config
+from rsi_ocr.importer import RenderPlan
 from rsi_ocr.mining import mine, warm
 from rsi_ocr.service import Service, ServiceError, command, jev_runtime_dir
 from rsi_ocr.store import json_text
@@ -132,7 +133,8 @@ def apply_model_selection(config, policy):
                         "judge": judge if judge and enabled(judge) else None}
 
 
-def run_local(config, output, jobs, pages=None, stage="all", session=None, progress=None, check_cancelled=None):
+def run_local(config, output, jobs, pages=None, stage="all", session=None, progress=None, check_cancelled=None,
+              layout_session=nullcontext, report_page=None):
     output.mkdir(parents=True, exist_ok=True)
     policy = config["mining"]
     target = policy["target"]
@@ -149,16 +151,43 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
     for alias in [target, *policy["teachers"]]:
         if stage not in ("all", alias):
             continue
-        with use_model(alias):
-            if alias == target and pages:
+        capture_root = output / "capture"
+        capture_stage = alias == target and pages is not None
+        plan = None
+        needs_model = True
+        if capture_stage:
+            if progress:
+                progress("检查整页断点 · " + str(capture_root))
+            pages = pages if isinstance(pages, RenderPlan) else pages.resolve()
+            plan = capture_plan(config, pages, capture_root, check_cancelled)
+            reused = sum(entry.cached for entry in plan)
+            pending = next((entry.page for entry in plan if not entry.cached), None)
+            message = f"版面与 OCR · 复用 {reused}/{len(plan)} 页 · 待处理 {len(plan) - reused} 页"
+            if pending:
+                message += f" · 从 {pending['doc_id']} 第 {pending['page_id']} 页继续"
+            else:
+                message += " · 跳过版面与基线推理"
+            if progress:
+                progress(message)
+            else:
+                print(message, flush=True)
+            if report_page:
+                report_page({"total": len(plan), "reused": reused, "done": 0, "current": ""})
+            needs_model = pending is not None or any(
+                manifest.resolve() != (capture_root / "regions.jsonl").resolve() for manifest, _ in jobs
+            )
+        with (use_model(alias) if needs_model else nullcontext()):
+            if capture_stage:
                 device = config["capture"].get("pipeline", {}).get("device", "cpu")
-                if str(device).partition(":")[0] == "gpu":
-                    if progress:
-                        progress(f"版面检测设备 · {device}")
-                    capture_gpu_pages(config, pages.resolve(), output / "capture", progress=progress,
+                with layout_session() as report_device:
+                    if pending and str(device).partition(":")[0] == "gpu":
+                        capture_gpu_pages(config, pages, output / "capture", progress=progress,
+                                          check_cancelled=check_cancelled, report_device=report_device,
+                                          plan=plan, report_page=report_page)
+                    else:
+                        capture_pages(config, pages, output / "capture", progress=progress,
+                                      report_device=report_device, plan=plan, report_page=report_page,
                                       check_cancelled=check_cancelled)
-                else:
-                    capture_pages(config, pages.resolve(), output / "capture", progress=progress)
             for manifest, run in jobs:
                 counts = warm(config, manifest, run, alias, check_cancelled=check_cancelled)
                 if progress:

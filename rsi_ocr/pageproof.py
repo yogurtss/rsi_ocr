@@ -36,7 +36,7 @@ def endpoint(port, path, payload=None, timeout=5):
         raise ValueError(f"无法连接 GlyphStack 后台 127.0.0.1:{port}，请检查 console 是否运行") from error
 
 
-def dashboard(snapshot, enqueue, closing=lambda: False):
+def dashboard(snapshot, enqueue, closing=lambda: False, model_logs=None):
     from rich.console import Console
     from rich.live import Live
     from .console_view import console_view
@@ -50,6 +50,8 @@ def dashboard(snapshot, enqueue, closing=lambda: False):
     last_refresh = 0.0
     console = Console()
     expanded = False
+    show_model_log = model_logs is not None and console.width >= 100
+    model_log = None
     last_message = ""
     concurrency_input = None
     try:
@@ -58,6 +60,11 @@ def dashboard(snapshot, enqueue, closing=lambda: False):
             while not closing():
                 if time.monotonic() - last_refresh >= 0.8:
                     snap = snapshot()
+                    if show_model_log:
+                        try:
+                            model_log = model_logs(selected)
+                        except (ValueError, OSError) as error:
+                            model_log = [f"读取模型日志失败 · {error}"]
                     last_refresh = time.monotonic()
                 frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 7) % 10]
                 message = last_message
@@ -65,7 +72,7 @@ def dashboard(snapshot, enqueue, closing=lambda: False):
                     limit = snap["models"][selected].get("max_sequences", "—")
                     message = f"{selected} 并发 {limit} → {concurrency_input or '_'}   Enter 提交 · Esc 取消"
                 live.update(console_view(snap, selected, message, expanded, console.width, console.height,
-                                         time.time(), frame), refresh=True)
+                                         time.time(), frame, model_log=model_log if show_model_log else None), refresh=True)
                 if select.select([fd], [], [], 0.18)[0]:
                     key = os.read(fd, 1).decode(errors="ignore").lower()
                     if key == "\x1b" and select.select([fd], [], [], 0.02)[0]:
@@ -87,10 +94,14 @@ def dashboard(snapshot, enqueue, closing=lambda: False):
                             concurrency_input += key
                     elif key in ("1", "2", "3", "4"):
                         selected = aliases[int(key) - 1]
+                        last_refresh = 0.0
                     elif key == "c":
                         concurrency_input = ""
                     elif key == "p":
                         expanded = not expanded
+                    elif key == "l" and model_logs is not None:
+                        show_model_log = not show_model_log
+                        last_refresh = 0.0
                     elif key in ("s", "x", "a", "t", "r"):
                         action = {"s": "start", "x": "stop", "a": "stop", "t": "restart", "r": "run"}[key]
                         value = {"r": None, "a": "all"}.get(key, selected)
@@ -133,7 +144,13 @@ def main(argv=None):
             interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.headless
             manager = Manager(settings, defaults, port, args.config.resolve(),
                               log_sink=None if interactive else lambda message: print(message, flush=True))
-            uvicorn.run(manager_app(manager, (lambda m: dashboard(m.snapshot, m.enqueue, m.closed.is_set)) if interactive else None), host="127.0.0.1",
+            terminal = None
+            if interactive:
+                def terminal(current):
+                    dashboard(current.snapshot, current.enqueue, current.closed.is_set,
+                              model_logs=current.model_log_tail)
+
+            uvicorn.run(manager_app(manager, terminal), host="127.0.0.1",
                         port=port, log_level="warning" if interactive else "info", access_log=False)
         elif args.command == "monitor":
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -141,7 +158,8 @@ def main(argv=None):
             dashboard(lambda: endpoint(args.port, "/status"),
                       lambda action, value, **options: endpoint(
                           args.port, "/jobs", {"action": action, "value": value, **options}
-                      )["id"])
+                      )["id"],
+                      model_logs=lambda alias: endpoint(args.port, f"/model-logs/{alias}", timeout=2))
         elif args.command in {"studio", "status"}:
             snap = endpoint(args.port, "/status")
             if snap.get("service") != "pageproof":
