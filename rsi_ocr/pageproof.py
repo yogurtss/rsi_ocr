@@ -142,6 +142,8 @@ def main(argv=None):
                             ("monitor", "连接已运行的后台并打开交互面板"), ("status", "查看模型与任务状态"), ("start", "加载模型"), ("stop", "卸载模型"), ("restart", "重读模型配置并重启")):
         client = sub.add_parser(name, help=help_text)
         client.add_argument("--port", type=int, default=DEFAULT_PORT, help="模型后台端口")
+        if name == "studio":
+            client.add_argument("--host", "-host", default="127.0.0.1", help="工作台监听地址，默认 127.0.0.1")
         if name == "run":
             client.add_argument("input", type=Path, nargs="?", help="省略时使用后台配置的 input_path")
         if name in ("start", "stop", "restart"):
@@ -187,7 +189,8 @@ def main(argv=None):
                 import uvicorn
                 from .review_app import create_app
 
-                uvicorn.run(create_app(library=Path(snap["output_root"]), manager_port=args.port), host="127.0.0.1", port=snap["studio_port"])
+                app = create_app(library=Path(snap["output_root"]), manager_port=args.port, host=args.host)
+                uvicorn.run(app, host=args.host, port=snap["studio_port"])
         else:
             if args.command == "run":
                 value = str(args.input.resolve()) if args.input else None

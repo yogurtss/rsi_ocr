@@ -3,6 +3,7 @@ import argparse
 from collections import Counter
 import difflib
 import json
+import re
 import sqlite3
 from typing import Literal
 from uuid import uuid4
@@ -11,12 +12,11 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel, Field
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from rsi_ocr.mining import FIXED_RULES, classify, select
 from rsi_ocr.formats import table_cells, table_metrics
@@ -233,7 +233,7 @@ class Location(BaseModel):
     box: tuple[int, int, int, int]
 
 
-def create_app(run=None, evaluation=None, production=None, library=None, manager_port=None):
+def create_app(run=None, evaluation=None, production=None, library=None, manager_port=None, *, host="127.0.0.1"):
     batches = {}
     if run:
         title = "OmniDocBench 基准评测" if evaluation else run.name
@@ -241,7 +241,16 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
     if production:
         batches["production"] = read_batch(production, None, "Paddle 原页采集")
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
+    if host not in {"0.0.0.0", "::"}:
+        authority = f"[{host}]" if ":" in host else host
+        allowed = re.compile(rf"(?:127\.0\.0\.1|localhost|{re.escape(authority)})(?::[0-9]+)?", re.IGNORECASE)
+
+        @app.middleware("http")
+        async def check_host(request: Request, call_next):
+            if not allowed.fullmatch(request.headers.get("host", "")):
+                return PlainTextResponse("Invalid host header", status_code=400)
+            return await call_next(request)
+
     app.mount("/assets", StaticFiles(directory=ASSETS), name="assets")
 
     @app.get("/api/runtime")
@@ -528,12 +537,14 @@ def main():
     cli.add_argument("--production", type=Path)
     cli.add_argument("--settings", type=Path, default=Path("configs/import.yaml"))
     cli.add_argument("--port", type=int)
+    cli.add_argument("--host", "-host", default="127.0.0.1", help="工作台监听地址，默认 127.0.0.1")
     cli.add_argument("--manager-port", type=int, help="connect deployment settings to a local model manager")
     args = cli.parse_args()
     from .config import load_config
     settings = load_config(args.settings)
-    app = create_app(args.run, args.evaluation, args.production, Path(settings["output_root"]).resolve(), args.manager_port)
-    uvicorn.run(app, host="127.0.0.1", port=args.port or (8516 if args.run else settings["port"]))
+    app = create_app(args.run, args.evaluation, args.production, Path(settings["output_root"]).resolve(),
+                     args.manager_port, host=args.host)
+    uvicorn.run(app, host=args.host, port=args.port or (8516 if args.run else settings["port"]))
 
 
 if __name__ == "__main__":
