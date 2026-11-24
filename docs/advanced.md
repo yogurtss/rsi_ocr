@@ -105,7 +105,7 @@ rsi-ocr --config configs/local.yaml train grpo --data runs/round01/data \
 
 ## 5. 单卡本地评测与复核
 
-以下示例使用仓库内的 Conda 环境、Linux/WSL 及 `/mnt/g/models`。单卡依次加载 Paddle、OXR、Ovis 和 Jev，OCR 响应写入 SQLite 缓存，后续评分和重试可复用。Paddle 页面版面分析使用 CPU。
+以下示例使用仓库内的 Conda 环境、Linux/WSL 及 `/mnt/g/models`。单卡依次加载 Paddle、OXR、Ovis 和 Jev，OCR 响应写入 SQLite 缓存，后续评分和重试可复用。Paddle 页面版面分析默认使用 CPU。
 
 ### 环境与模型
 

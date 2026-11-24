@@ -338,6 +338,31 @@ class ManagerTests(unittest.TestCase):
             self.assertTrue(manager.models["paddle"]["enabled"])
             manager.unload_all()
 
+    def test_layout_device_can_be_saved_without_changing_model_devices(self):
+        from rsi_ocr.manager import Manager
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.yaml"
+            path.write_text(Path("configs/import.yaml").read_text())
+            base = Path("configs/default.yaml")
+            settings = load_config(path)
+            settings["deployment"].pop("layout_device")
+            manager = Manager(settings, base, 8520, path)
+            self.assertEqual(manager.snapshot()["layout_device"], "cpu")
+
+            manager.set_deployment("on_demand", {}, layout_device="gpu:2")
+            manager.set_deployment("on_demand", {})
+            reloaded = Manager(load_config(path), base, 8520, path)
+            self.assertEqual(manager.snapshot()["layout_device"], "gpu:2")
+            self.assertEqual(reloaded.config["capture"]["pipeline"]["device"], "gpu:2")
+            self.assertEqual(reloaded.models["paddle"]["gpu"], "0")
+
+            with self.assertRaisesRegex(ValueError, "deployment.layout_device"):
+                manager.set_deployment("on_demand", {}, layout_device="gpu:-1")
+            self.assertEqual(load_config(path)["deployment"]["layout_device"], "gpu:2")
+            manager.set_deployment("on_demand", {}, layout_device="cpu")
+            self.assertEqual(manager.snapshot()["layout_device"], "cpu")
+
     def test_managed_inference_with_only_paddle(self):
         from rsi_ocr.manager import Manager
 

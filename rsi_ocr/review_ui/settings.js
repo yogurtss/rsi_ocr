@@ -171,12 +171,18 @@ function readDeployment() {
       gpu: row.querySelector("[name=gpu]").value.trim(),
     },
   ]));
-  return {mode:q("#deployment-mode").value, models};
+  const layout = q("#layout-device").value;
+  const layout_device = layout === "gpu" ? `gpu:${q("#layout-gpu").value}` : "cpu";
+  return {mode:q("#deployment-mode").value, layout_device, models};
 }
 
 function updateDeploymentButton() {
+  const useGpu = q("#layout-device").value === "gpu";
+  q("#layout-gpu-field").hidden = !useGpu;
+  q("#layout-gpu").disabled = !useGpu;
   const current = readDeployment();
   q("#save-deployment").disabled = !savedDeployment || !Object.values(current.models).every(model => model.path)
+    || (useGpu && !/^gpu:[0-9]+$/.test(current.layout_device))
     || JSON.stringify(current) === JSON.stringify(savedDeployment);
 }
 
@@ -189,6 +195,9 @@ async function loadDeployment(message) {
     const runtime = await api("/api/runtime");
     if (!runtime.connected || !runtime.mode) throw new Error("通过 glyphstack studio 连接后台后可修改模型设置。");
     q("#deployment-mode").value = runtime.mode;
+    const [layout, gpu] = (runtime.layout_device || "cpu").split(":");
+    q("#layout-device").value = layout;
+    q("#layout-gpu").value = gpu ?? "0";
     q("#deployment-models").innerHTML = Object.entries(runtime.models).map(([alias, model]) =>
       `<div class="deployment-model" data-model="${esc(alias)}">
         <label><input type="checkbox" name="enabled" ${model.enabled !== false ? "checked" : ""}
@@ -221,7 +230,7 @@ q("#deployment-form").onsubmit = async event => {
   status.textContent = "正在保存模型设置…";
   try {
     await api("/api/runtime/deployment", {method:"PUT", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({mode:current.mode, models})});
+      body:JSON.stringify({mode:current.mode, layout_device:current.layout_device, models})});
     savedDeployment = current;
     loadingDeployment = false;
     await loadDeployment(current.mode === "managed"

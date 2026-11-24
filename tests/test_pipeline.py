@@ -8,7 +8,7 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
-from rsi_ocr.capture import Recorder, capture_pages
+from rsi_ocr.capture import Recorder, capture_gpu_pages, capture_pages
 from rsi_ocr.config import load_config
 from rsi_ocr.formats import table_cells, table_otsl
 from rsi_ocr.mining import mine
@@ -25,6 +25,13 @@ MERGED = '<table><tr><td rowspan="2" colspan="2">A</td><td>B</td></tr><tr><td>C<
 
 def chat(text, finish="stop"):
     return {"choices": [{"message": {"content": text}, "finish_reason": finish}]}
+
+
+def fake_gpu_capture_worker(config, manifest, root, messages):
+    with messages:
+        device = config["capture"]["pipeline"]["device"]
+        write_rows(root / "regions.jsonl", [{"device": device}])
+        messages.send(("progress", device))
 
 
 class PipelineTest(unittest.TestCase):
@@ -88,6 +95,15 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((path.parent / row["image"]).read_bytes(), PNG)
         self.assertEqual(row["target"]["raw"], "raw OCR")
         self.assertEqual(row["target"]["parameters"], {"max_tokens": 200})
+
+    def test_gpu_capture_worker_reports_progress_and_exits(self):
+        self.config["capture"]["pipeline"]["device"] = "gpu:2"
+        progress = []
+        output = self.root / "capture"
+        with patch("rsi_ocr.capture._capture_gpu_worker", fake_gpu_capture_worker):
+            capture_gpu_pages(self.config, self.root / "pages.jsonl", output, progress=progress.append)
+        self.assertEqual(progress, ["gpu:2"])
+        self.assertEqual(list(read_rows(output / "regions.jsonl")), [{"device": "gpu:2"}])
 
     def test_mining_verdicts_audit_and_approved_exports(self):
         region_file = self.root / "regions.jsonl"

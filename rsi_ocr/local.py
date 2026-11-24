@@ -1,13 +1,14 @@
 """Configure local OCR services and reuse their cached responses."""
 import json
 import os
+import re
 import signal
 import subprocess
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
-from rsi_ocr.capture import capture_pages
+from rsi_ocr.capture import capture_gpu_pages, capture_pages
 from rsi_ocr.config import load_config
 from rsi_ocr.mining import mine, warm
 from rsi_ocr.service import Service, ServiceError, command, jev_runtime_dir
@@ -150,7 +151,14 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
             continue
         with use_model(alias):
             if alias == target and pages:
-                capture_pages(config, pages.resolve(), output / "capture", progress=progress)
+                device = config["capture"].get("pipeline", {}).get("device", "cpu")
+                if str(device).partition(":")[0] == "gpu":
+                    if progress:
+                        progress(f"版面检测设备 · {device}")
+                    capture_gpu_pages(config, pages.resolve(), output / "capture", progress=progress,
+                                      check_cancelled=check_cancelled)
+                else:
+                    capture_pages(config, pages.resolve(), output / "capture", progress=progress)
             for manifest, run in jobs:
                 counts = warm(config, manifest, run, alias, check_cancelled=check_cancelled)
                 if progress:
@@ -194,6 +202,9 @@ def set_concurrency(spec, sequences):
 
 def configure_models(config, root, minicpm=None, deployment=None):
     deployment = deployment or {}
+    layout_device = deployment.get("layout_device", "cpu")
+    if not isinstance(layout_device, str) or not re.fullmatch(r"cpu|gpu:[0-9]+", layout_device):
+        raise ValueError("deployment.layout_device 需为 cpu 或 gpu:<编号>，例如 gpu:0")
     models = config["models"]
     models["paddle"]["revision"] = "PaddleOCR-VL-1.6-local"
     models["oxr"]["revision"] = "OXR-1.0-c708407f"
@@ -280,7 +291,8 @@ def configure_models(config, root, minicpm=None, deployment=None):
             entry for entry in (str(libraries), os.environ.get("LD_LIBRARY_PATH")) if entry
         )
     config["capture"]["pipeline"].update(
-        pipeline_version="v1.6", device="cpu", layout_detection_model_dir=str(root / deployment.get("layout_path", "PP-DocLayoutV3")),
+        pipeline_version="v1.6", device=layout_device,
+        layout_detection_model_dir=str(root / deployment.get("layout_path", "PP-DocLayoutV3")),
     )
     config["mining"]["workers"] = 4
     config["mining"]["splits"].append("benchmark")

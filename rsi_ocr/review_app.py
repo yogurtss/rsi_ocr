@@ -254,6 +254,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         except ValueError:
             return {"connected": False}
         return {"connected": True, "mode": status.get("mode"), "models": status["models"],
+                "layout_device": status.get("layout_device", "cpu"),
                 "jobs": [job for job in status["jobs"] if job["status"] in {"running", "queued"}]}
 
     @app.put("/api/runtime/deployment/{mode}")

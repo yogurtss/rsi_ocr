@@ -1,8 +1,11 @@
 import base64
 import json
+import os
+import traceback
 from collections import defaultdict
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from multiprocessing import get_context
 from pathlib import Path
 from threading import Lock, Thread
 
@@ -120,8 +123,66 @@ class Recorder:
                 thread.join()
 
 
+def _capture_gpu_worker(config, manifest, root, messages):
+    with messages, (root / "layout.log").open("a") as log:
+        os.dup2(log.fileno(), 1)
+        os.dup2(log.fileno(), 2)
+        os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
+        try:
+            capture_pages(config, manifest, root, progress=lambda text: messages.send(("progress", text)))
+        except Exception as error:
+            traceback.print_exc(file=log)
+            messages.send(("error", str(error)))
+
+
+def capture_gpu_pages(config, manifest, root, progress=None, check_cancelled=None):
+    """Release Paddle's CUDA context before handing the GPU to the next model."""
+    root.mkdir(parents=True, exist_ok=True)
+    context = get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    with reader, writer:
+        worker = context.Process(target=_capture_gpu_worker, args=(config, manifest, root, writer))
+        worker.start()
+        writer.close()
+        try:
+            while True:
+                if check_cancelled:
+                    check_cancelled()
+                if not reader.poll(0.2):
+                    continue
+                try:
+                    kind, message = reader.recv()
+                except EOFError:
+                    break
+                if kind == "error":
+                    raise RuntimeError(f"{message} · 日志 {root / 'layout.log'}")
+                if progress:
+                    progress(message)
+            while worker.is_alive():
+                if check_cancelled:
+                    check_cancelled()
+                worker.join(timeout=0.2)
+            if worker.exitcode != 0:
+                raise RuntimeError(f"GPU 版面检测退出（{worker.exitcode}）· 日志 {root / 'layout.log'}")
+        finally:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=2)
+                if worker.is_alive():
+                    worker.kill()
+            worker.join()
+            worker.close()
+
+
 def capture_pages(config, manifest, root, progress=None):
     from collections import Counter
+
+    device = config["capture"].get("pipeline", {}).get("device", "cpu")
+    if str(device).partition(":")[0] == "gpu":
+        import paddle
+
+        if not paddle.is_compiled_with_cuda():
+            raise ValueError("GPU 版面检测需要支持 CUDA 的 paddlepaddle-gpu，请检查 Console 的 Python 环境")
 
     from paddleocr import PaddleOCRVL
 

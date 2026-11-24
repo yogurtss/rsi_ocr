@@ -138,6 +138,7 @@ class Manager:
             return {"requests": requests, "logs": [entry.copy() for entry in self.logs],
                     "config_path": str(self.config_path or ""),
                     "service": "pageproof", "mode": self.mode, "port": self.port, "studio_port": self.settings["port"],
+                    "layout_device": self.config["capture"]["pipeline"]["device"],
                     "output_root": str(self.root), "input_path": str(self.default_input),
                     "models": {k: v.copy() for k, v in self.models.items()},
                     "jobs": [v.copy() for v in finished[-25:] + active]}
@@ -251,7 +252,7 @@ class Manager:
             elif previous == "managed":
                 self.enqueue("stop", "all")
 
-    def set_deployment(self, mode, changes):
+    def set_deployment(self, mode, changes, layout_device=None):
         with self.lock:
             if not self.config_path:
                 raise ValueError("后台缺少 YAML 配置路径")
@@ -261,6 +262,8 @@ class Manager:
             yaml, settings = self.read_settings()
             deployment = settings.setdefault("deployment", {})
             deployment["mode"] = mode
+            if layout_device is not None:
+                deployment["layout_device"] = layout_device
             options = deployment.setdefault("models", {})
             for alias, change in changes.items():
                 model = options.setdefault(alias, {})
@@ -475,6 +478,7 @@ class ModelSettings(BaseModel):
 class DeploymentSettings(BaseModel):
     mode: Literal["on_demand", "managed"]
     models: dict[str, ModelSettings]
+    layout_device: str | None = None
 
 
 def manager_app(manager, terminal=None):
@@ -524,7 +528,7 @@ def manager_app(manager, terminal=None):
     @app.post("/deployment")
     def save_deployment(settings: DeploymentSettings):
         try:
-            manager.set_deployment(settings.mode, settings.models)
+            manager.set_deployment(settings.mode, settings.models, layout_device=settings.layout_device)
         except (ValueError, OSError) as error:
             raise HTTPException(409, str(error)) from error
         return {"mode": manager.mode}
