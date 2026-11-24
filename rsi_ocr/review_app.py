@@ -27,6 +27,7 @@ from rsi_ocr.training import paddle_sft_record
 
 ASSETS = Path(__file__).with_name("review_ui")
 SFT_SPLITS = {"mine": "train", "train": "train", "val": "val"}
+BATCH_FILES = ("summary.json", "review.jsonl", "evidence.jsonl")
 
 
 def decision_db(path):
@@ -276,6 +277,10 @@ class Location(BaseModel):
     box: tuple[int, int, int, int]
 
 
+class ImportPath(BaseModel):
+    path: str
+
+
 def create_app(run=None, evaluation=None, production=None, library=None, manager_port=None, *, host="127.0.0.1"):
     batches = {}
     if run:
@@ -390,7 +395,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         for path in sorted(library.iterdir(), reverse=True):
             run_path = path / "production"
             if run_path.resolve().is_relative_to(library.resolve()) and all(
-                (run_path / name).is_file() for name in ("summary.json", "review.jsonl", "evidence.jsonl")
+                (run_path / name).is_file() for name in BATCH_FILES
             ):
                 result[path.name] = run_path
         return result
@@ -423,17 +428,41 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                 pass
         raise HTTPException(404, "批次没有可用的首页预览")
 
+    def open_import(path, name):
+        path = path.resolve()
+        identity = str(path)
+        if library and path == library.resolve() / name / "production":
+            identity = name  # Keep existing library batch IDs and their browser undo history.
+        key = "import-" + digest(identity.encode())[:20]
+        try:
+            batches[key] = read_batch(path, None, name)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            raise HTTPException(422, f"批次读取失败：{error}") from error
+        return {"id": key, "name": name}
+
+    @app.post("/api/imports")
+    def import_by_path(source: ImportPath):
+        raw = source.path.strip()
+        if not raw or "\x00" in raw:
+            raise HTTPException(422, "请输入服务器上的结果目录路径")
+        try:
+            directory = ((library or Path.cwd()) / Path(raw).expanduser()).resolve()
+            if not directory.is_dir():
+                raise HTTPException(422, f"目录不存在或无法访问：{directory}")
+            path = directory / "production" if (directory / "production").is_dir() else directory
+            missing = [name for name in BATCH_FILES if not (path / name).is_file()]
+        except (OSError, RuntimeError) as error:
+            raise HTTPException(422, f"无法打开目录：{error}") from error
+        if missing:
+            raise HTTPException(422, f"请指定已完成的批次或 production 目录。{path} 缺少 {', '.join(missing)}")
+        return open_import(path, path.parent.name if path.name == "production" else path.name)
+
     @app.post("/api/imports/{name}")
     def import_batch(name: str):
         path = available_runs().get(name)
         if path is None:
             raise HTTPException(404, "批次不存在或仍在生成")
-        key = "import-" + digest(name.encode())[:20]
-        try:
-            batches[key] = read_batch(path, None, name)
-        except (ValueError, KeyError, OSError) as error:
-            raise HTTPException(422, f"批次读取失败：{error}") from error
-        return {"id": key, "name": name}
+        return open_import(path, name)
 
     @app.get("/api/batches")
     def batch_list():

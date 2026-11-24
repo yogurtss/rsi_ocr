@@ -82,7 +82,7 @@ glyphstack run examples/inputs --port 8520
 glyphstack studio --port 8520
 ```
 
-导入自检应在打印出的 `input/pages.jsonl` 中生成两条记录。完整推理完成后，打开 [复核工作台](http://127.0.0.1:8517)，在导入页通过首页缩略图辨认批次，也可搜索首份文件名或批次名。点批次卡片即可导入并复核。工作台右上角的 **导入结果** 可随时打开批次列表。样例包含一张[文字图片](examples/inputs/inspection.png)和一份[单页表格 PDF](examples/inputs/measurements.pdf)，可核对图片上的 `12.50 mm` 和表格首行的 `GS-001 / 12.20`。
+导入自检应在打印出的 `input/pages.jsonl` 中生成两条记录。完整推理完成后，打开 [复核工作台](http://127.0.0.1:8517)，在导入页通过首页缩略图辨认批次，也可搜索首份文件名或批次名。点批次卡片即可导入并复核。也可以点右上角的 **导入结果**，粘贴服务器上已完成的批次路径（如 `/data/runs/批次名` 或 `/data/runs/批次名/production`），按回车或点 **加载** 进入复核。相对路径以后台配置的 `output_root` 为起点。只有 `--import-only` 生成的页图时，需先用 `glyphstack run` 完成推理，批次才会出现在列表中。样例包含一张[文字图片](examples/inputs/inspection.png)和一份[单页表格 PDF](examples/inputs/measurements.pdf)，可核对图片上的 `12.50 mm` 和表格首行的 `GS-001 / 12.20`。
 
 后台和工作台默认监听 `127.0.0.1`。要从可信局域网直接访问，在服务器上用下面的命令启动 Studio，再从浏览器打开 `http://服务器IP:8517`。
 

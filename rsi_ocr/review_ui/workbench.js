@@ -81,9 +81,11 @@ function notice(message, error = false) {
 
 async function api(path, options) {
   const response = await fetch(path, {cache: "no-store", ...options});
-  const result = await response.json();
-  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "请求失败，请重试");
-  return result;
+  if (!response.ok) {
+    const result = await response.json().catch(() => null);
+    throw new Error(typeof result?.detail === "string" ? result.detail : `请求失败（HTTP ${response.status}）`);
+  }
+  return response.json();
 }
 
 const batchPath = () => "/api/batches/" + encodeURIComponent(state.batch);
@@ -650,7 +652,7 @@ async function saveReview(status) {
   const next = state.rows.slice(state.rows.indexOf(row) + 1).find(item => item.review_status === "pending")
     || state.rows.find(item => item.case_id !== state.current && item.review_status === "pending");
   state.saving = true;
-  q("#batch").disabled = true;
+  q("#batch").disabled = q("#import-open").disabled = true;
   q("#pass").disabled = true;
   q("#reject").disabled = true;
   q("#table-pass").disabled = true;
@@ -677,7 +679,7 @@ async function saveReview(status) {
     q("#table-feedback").textContent = error.message;
   } finally {
     state.saving = false;
-    q("#batch").disabled = false;
+    q("#batch").disabled = q("#import-open").disabled = false;
     if (state.case && q("#pass")) q("#pass").disabled = !state.case.models[state.compare]?.label;
     if (q("#reject")) q("#reject").disabled = false;
     q("#table-pass").disabled = Boolean(q("#pass")?.disabled);
@@ -867,7 +869,6 @@ function view(page) {
   q("#overview").hidden = page !== "overview";
   q("#view-review").setAttribute("aria-pressed", page === "review");
   q("#view-overview").setAttribute("aria-pressed", page === "overview");
-  if (page === "library") refreshImports();
 }
 
 q("#view-review").addEventListener("click", () => view("review"));
@@ -981,6 +982,8 @@ let imports = [];
 let readingImports = 0;
 let importing = "";
 let visibleImports = 8;
+const importDialog = q("#import-dialog");
+const importPath = q("#import-path");
 
 function batchLabel(name) {
   const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})\.\d+Z$/.exec(name);
@@ -998,7 +1001,7 @@ function renderImports() {
   q("#import-count").textContent = query ? `${items.length} / ${imports.length}` : String(imports.length);
   q("#import-more").hidden = remaining <= 0;
   q("#import-more").textContent = `显示更多批次（还有 ${remaining} 个）`;
-  q("#import-message").textContent = !imports.length ? "暂无已完成的批次。运行 glyphstack run 后，点击刷新。" :
+  q("#import-message").textContent = !imports.length ? "下方结果目录中暂无可导入的批次。请确认完整推理已结束，再点击刷新。" :
     !items.length ? "没有匹配的批次，可更换文件名或清空搜索。" : "";
   q("#import-list").innerHTML = items.slice(0, visibleImports).map(item => {
     const title = item.first_doc || batchLabel(item.name);
@@ -1036,7 +1039,13 @@ async function refreshImports() {
   }
 }
 
-q("#import-open").onclick = () => { if (!state.saving) view("library"); };
+q("#import-open").onclick = () => {
+  if (state.saving || importing) return;
+  q("#import-path-status").textContent = "";
+  importDialog.showModal();
+  importPath.focus();
+  importPath.select();
+};
 q("#import-refresh").onclick = refreshImports;
 q("#import-search").oninput = () => { visibleImports = 8; renderImports(); };
 q("#import-more").onclick = () => {
@@ -1047,30 +1056,53 @@ q("#import-more").onclick = () => {
 q("#import-list").addEventListener("error", event => {
   if (event.target.tagName === "IMG") event.target.remove();
 }, true);
-q("#import-list").onclick = async event => {
+q("#import-list").onclick = event => {
   const trigger = event.target.closest("button[data-import]");
-  if (!trigger || importing || state.saving) return;
-  importing = trigger.dataset.import;
+  if (trigger) openImport(trigger.dataset.import, trigger);
+};
+q("#import-path-form").onsubmit = event => {
+  event.preventDefault();
+  const path = importPath.value.trim();
+  if (path) openImport(path);
+  else {
+    q("#import-path-status").textContent = "请输入服务器上的结果目录路径";
+    importPath.focus();
+  }
+};
+
+async function openImport(value, trigger) {
+  if (importing || state.saving) return;
+  importing = value;
+  q("#import-path-status").textContent = "";
+  q("#import-load").disabled = importPath.readOnly = true;
+  q("#import-load").textContent = "正在加载…";
+  q("#import-open").disabled = true;
   q("#import-refresh").disabled = true;
   q("#import-list").querySelectorAll("button").forEach(button => { button.disabled = true; });
-  trigger.querySelector(".batch-action b").textContent = "正在导入…";
+  if (trigger) trigger.querySelector(".batch-action b").textContent = "正在导入…";
   let errorMessage = "";
   try {
-    const batch = await api("/api/imports/" + encodeURIComponent(importing), {method:"POST"});
+    const batch = trigger ? await api("/api/imports/" + encodeURIComponent(value), {method:"POST"}) :
+      await api("/api/imports", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({path:value})});
+    if (!trigger && !importDialog.open) return;
     const select = q("#batch");
     if (![...select.options].some(option => option.value === batch.id)) select.add(new Option(batchLabel(batch.name), batch.id));
     select.value = batch.id;
+    if (!trigger) importDialog.close();
     view("review");
     await loadBatch(batch.id);
   } catch (error) {
     errorMessage = "导入失败 · " + error.message;
   } finally {
     importing = "";
+    q("#import-load").disabled = importPath.readOnly = false;
+    q("#import-load").textContent = "加载";
+    q("#import-open").disabled = false;
     q("#import-refresh").disabled = false;
     renderImports();
-    if (errorMessage) q("#import-message").textContent = errorMessage;
+    if (errorMessage) q(trigger ? "#import-message" : "#import-path-status").textContent = errorMessage;
   }
-};
+}
 
 api("/api/batches").then(batches => {
   q("#batch").replaceChildren(...Object.entries(batches).map(([id, label]) => new Option(batchLabel(label), id)));

@@ -314,6 +314,12 @@ dialog::backdrop { background: #101b34bb; }
 .library-heading p { color:var(--muted); margin-top:13px; line-height:1.6; }
 .library-tools { display:flex; align-items:center; gap:10px; margin:24px 0 16px; flex-wrap:wrap; }
 .library-tools h3 { margin-right:auto; font-size:1.02rem; }
+#import-dialog { width:min(92vw,520px); }
+#import-path-form { display:grid; gap:10px; padding:20px; }
+#import-path-form small { color:var(--muted); }
+#import-path-status { color:#a13928; overflow-wrap:anywhere; }
+#import-path-status:empty { display:none; }
+#import-load { justify-self:end; }
 #import-count { display:inline-block; padding:2px 7px; border-radius:5px; background:#e5e4f4; color:#514986;
   font:600 .76rem "IBM Plex Mono",monospace; vertical-align:middle; }
 .library-tools input { width:min(17rem,43%); min-width:0; }

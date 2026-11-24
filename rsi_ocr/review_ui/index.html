@@ -25,7 +25,7 @@
           <button type="button" id="training-download" data-export="train" hidden>SFT 训练集 JSONL</button>
           <button type="button" id="validation-download" data-export="val" hidden>SFT 验证集 JSONL</button></div>
       </details>
-      <button class="primary" id="import-open"><span aria-hidden="true">＋</span> 导入结果</button>
+      <button class="primary" id="import-open" aria-haspopup="dialog" aria-controls="import-dialog"><span aria-hidden="true">＋</span> 导入结果</button>
     </div>
   </header>
   <div id="notice" class="notice" role="status" hidden></div>
@@ -42,6 +42,18 @@
       <footer id="import-root"></footer>
     </section>
   </main>
+  <dialog id="import-dialog" aria-labelledby="import-dialog-title">
+    <div class="dialog-bar"><strong id="import-dialog-title">按路径导入结果</strong>
+      <form method="dialog"><button>关闭</button></form></div>
+    <form id="import-path-form">
+      <label for="import-path">服务器上的结果目录</label>
+      <input id="import-path" type="text" placeholder="/data/runs/批次名/production"
+             required autofocus autocomplete="off" spellcheck="false" aria-describedby="import-path-hint">
+      <small id="import-path-hint">可填批次目录或其 production 子目录。相对路径从后台配置的结果目录开始。</small>
+      <p id="import-path-status" role="status"></p>
+      <button type="submit" class="primary" id="import-load">加载</button>
+    </form>
+  </dialog>
   <div id="workspace" class="workspace" hidden>
     <button id="mobile-queue" aria-expanded="false" aria-controls="sample-queue">样本目录</button>
     <aside id="sample-queue" class="queue" aria-label="样本队列">
