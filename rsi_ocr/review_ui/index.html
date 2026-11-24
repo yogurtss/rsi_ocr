@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GlyphStack · 文档复核</title>
   <link rel="stylesheet" href="/assets/workbench.css">
-  <script src="/assets/workbench.js" defer></script>
+  <script src="/assets/workbench.js?v=import-summary-1" defer></script>
   <script src="/assets/settings.js" defer></script>
 </head>
 <body>
@@ -36,7 +36,7 @@
       <div class="library-tools"><h3 id="imports-heading">全部批次 <span id="import-count"></span></h3>
         <input type="search" id="import-search" aria-label="搜索批次或文件名" placeholder="搜索批次或文件名" hidden>
         <button id="import-refresh">刷新</button></div>
-      <p id="import-message" role="status">正在读取批次…</p>
+      <p id="import-message" role="status">正在获取可导入的批次列表…</p>
       <div class="import-progress" id="card-progress" hidden><span role="status"></span><progress aria-label="批次读取进度"></progress></div>
       <div id="import-list"></div>
       <button type="button" id="import-more" hidden></button>
@@ -52,8 +52,9 @@
              required autofocus autocomplete="off" spellcheck="false" aria-describedby="import-path-hint">
       <small id="import-path-hint">可填批次目录或其 production 子目录。相对路径从后台配置的结果目录开始。</small>
       <p id="import-path-status" role="status"></p>
+      <output id="import-summary" hidden></output>
       <div class="import-progress" id="path-progress" hidden><span role="status"></span><progress aria-label="批次读取进度"></progress></div>
-      <button type="submit" class="primary" id="import-load">加载</button>
+      <button type="submit" class="primary" id="import-load">读取摘要</button>
     </form>
   </dialog>
   <div id="workspace" class="workspace" hidden>
@@ -99,7 +100,7 @@
       <button id="queue-toggle" type="button" aria-controls="sample-queue" aria-expanded="true" aria-label="收起队列" title="收起队列">‹</button>
       <div id="queue-divider" role="separator" tabindex="0" aria-label="样本队列宽度" aria-orientation="vertical" aria-controls="sample-queue" aria-valuemin="0" aria-valuemax="460" title="拖动调整宽度，也可使用左右方向键"></div>
     </div>
-    <main id="inspection" class="inspection" aria-label="样本详情"><p class="empty">正在读取批次…</p></main>
+    <main id="inspection" class="inspection" aria-label="样本详情"><p class="empty">请选择批次以查看样本。</p></main>
   </div>
   <main id="overview" class="overview" hidden></main>
   <main id="settings" class="settings" hidden>

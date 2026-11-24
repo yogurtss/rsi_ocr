@@ -188,10 +188,13 @@ def batch_lines(path, stage, report):
     with path.open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         offset = 0
-        next_update = 0
+        records = 0
+        if report:
+            report(stage, path.name, records, offset, size)
+        next_update = monotonic() + 0.25
         for line in stream:
             if report and monotonic() >= next_update:
-                report(stage, offset, size)
+                report(stage, path.name, records, offset, size)
                 next_update = monotonic() + 0.25
             start = offset
             offset += len(line)
@@ -199,8 +202,9 @@ def batch_lines(path, stage, report):
                 line = line.removeprefix(b"\xef\xbb\xbf")
             if line.strip():
                 yield start, line
+                records += 1
         if report:
-            report(stage, offset, size)
+            report(stage, path.name, records, offset, size)
 
 
 @contextmanager
@@ -528,9 +532,10 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         raise HTTPException(404, "批次没有可用的首页预览")
 
     def read_import(key, path, name, version):
-        def progress(stage, done, total):
+        def progress(stage, filename, records, done, total):
             with import_lock:
-                imports[key]["progress"] = {"state": "reading", "stage": stage, "done": done, "total": total}
+                imports[key]["progress"] = {"state": "reading", "stage": stage, "file": filename,
+                                            "records": records, "done": done, "total": total}
 
         try:
             batch = read_batch(path, None, name, progress)
@@ -573,8 +578,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                 raise HTTPException(404, "导入任务不存在，请重新导入")
             return imports[key]["progress"]
 
-    @app.post("/api/imports")
-    def import_by_path(source: ImportPath, background: bool = False):
+    def resolve_import_path(source):
         raw = source.path.strip()
         if not raw or "\x00" in raw:
             raise HTTPException(422, "请输入服务器上的结果目录路径")
@@ -588,6 +592,21 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
             raise HTTPException(422, f"无法打开目录：{error}") from error
         if missing:
             raise HTTPException(422, f"请指定已完成的批次或 production 目录。{path} 缺少 {', '.join(missing)}")
+        return path
+
+    @app.post("/api/import-preview")
+    def preview_import(source: ImportPath):
+        path = resolve_import_path(source)
+        try:
+            summary = document(path / "summary.json")
+            return {"path": str(path), "regions": summary.get("scanned"), "review": summary.get("review"),
+                    "hard_cases": summary.get("hard_cases"), "bytes": (path / "evidence.jsonl").stat().st_size}
+        except (OSError, ValueError, AttributeError) as error:
+            raise HTTPException(422, f"无法读取批次摘要：{error}") from error
+
+    @app.post("/api/imports")
+    def import_by_path(source: ImportPath, background: bool = False):
+        path = resolve_import_path(source)
         return open_import(path, path.parent.name if path.name == "production" else path.name, background)
 
     @app.post("/api/imports/{name}")

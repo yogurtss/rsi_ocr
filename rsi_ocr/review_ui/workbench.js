@@ -1110,9 +1110,23 @@ async function refreshImports() {
   }
 }
 
+let previewPath = "";
+let previewRequest;
+function resetPreview() {
+  previewRequest?.abort();
+  previewRequest = null;
+  previewPath = "";
+  q("#import-summary").hidden = true;
+  q("#path-progress").hidden = true;
+  q("#import-path-status").textContent = "";
+  q("#import-load").disabled = false;
+  q("#import-load").textContent = "读取摘要";
+}
+importPath.oninput = resetPreview;
+importDialog.addEventListener("close", resetPreview);
 q("#import-open").onclick = () => {
   if (state.saving || importing) return;
-  q("#import-path-status").textContent = "";
+  resetPreview();
   importDialog.showModal();
   importPath.focus();
   importPath.select();
@@ -1131,19 +1145,46 @@ q("#import-list").onclick = event => {
   const trigger = event.target.closest("button[data-import]");
   if (trigger) openImport(trigger.dataset.import, trigger);
 };
-q("#import-path-form").onsubmit = event => {
+q("#import-path-form").onsubmit = async event => {
   event.preventDefault();
   const path = importPath.value.trim();
-  if (path) openImport(path);
-  else {
+  if (!path) {
     q("#import-path-status").textContent = "请输入服务器上的结果目录路径";
     importPath.focus();
+    return;
+  }
+  if (previewPath) return openImport(previewPath);
+  if (previewRequest) return;
+  const controller = new AbortController();
+  previewRequest = controller;
+  const panel = q("#path-progress");
+  q("#import-path-status").textContent = "";
+  q("#import-load").disabled = true;
+  showImportProgress(panel, {stage:"正在读取 summary.json…"});
+  try {
+    const data = await api("/api/import-preview", {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({path}), signal:controller.signal});
+    if (controller.signal.aborted) return;
+    previewPath = data.path;
+    const summary = q("#import-summary");
+    summary.textContent = `共 ${data.regions ?? "—"} 个区域 · 复核队列 ${data.review ?? "—"} 个 · 难例 ${data.hard_cases ?? "—"} 个 · 结果文件 ${(data.bytes / 1048576).toFixed(1)} MiB`;
+    summary.hidden = false;
+    q("#import-load").textContent = "开始复核";
+  } catch (error) {
+    if (!controller.signal.aborted) q("#import-path-status").textContent = "读取批次摘要失败 · " + error.message;
+  } finally {
+    if (previewRequest === controller) {
+      previewRequest = null;
+      panel.hidden = true;
+      q("#import-load").disabled = false;
+    }
   }
 };
 
 function showImportProgress(panel, status) {
   const bar = panel.querySelector("progress");
   let label = status.stage || "正在打开批次";
+  if (status.file) label += ` · ${status.file} · 已读 ${status.records.toLocaleString()} 条`;
   if (status.total > 0) {
     bar.max = status.total;
     bar.value = status.done;
@@ -1193,7 +1234,7 @@ async function openImport(value, trigger) {
     panel.hidden = true;
     importing = "";
     q("#import-load").disabled = importPath.readOnly = false;
-    q("#import-load").textContent = "加载";
+    q("#import-load").textContent = previewPath ? "开始复核" : "读取摘要";
     q("#import-open").disabled = false;
     q("#import-refresh").disabled = false;
     renderImports();
@@ -1202,10 +1243,17 @@ async function openImport(value, trigger) {
 }
 
 api("/api/batches").then(batches => {
-  q("#batch").replaceChildren(...Object.entries(batches).map(([id, label]) => new Option(batchLabel(label), id)));
-  if (q("#batch").value) {
+  const select = q("#batch");
+  if (importing || state.batch || importDialog.open) return;
+  const options = Object.entries(batches).map(([id, label]) => new Option(batchLabel(label), id));
+  const preload = options.find(option => ["production", "benchmark"].includes(option.value));
+  const placeholder = new Option("选择已打开批次", "");
+  placeholder.disabled = true;
+  select.replaceChildren(placeholder, ...options);
+  select.value = preload?.value || "";
+  if (preload) {
     if (!q("#library").hidden) view("review");
-    return loadBatch(q("#batch").value);
+    return loadBatch(preload.value);
   }
   if (!q("#library").hidden) refreshImports();
 }).catch(error => {
