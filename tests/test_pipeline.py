@@ -303,8 +303,15 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((results["text"]["model_alias"], results["text"]["label"]), ("oxr", "Total 001"))
         self.assertEqual(results["text"]["status"], "selected")
         self.assertAlmostEqual(results["text"]["margin"], 0.9)
-        self.assertEqual(results["table"]["status"], "unavailable")
-        self.assertIsNone(results["table"]["label"])
+        self.assertEqual(results["table"]["status"], "selected")
+        self.assertTrue(results["table"]["label"])
+        self.assertIsNone(results["table"]["prob_yes"])
+        manifest = list(read_rows(output / "training" / "training_manifest.jsonl"))
+        self.assertEqual(len(manifest), sum(summary["training"].values()))
+        for record in manifest:
+            selected = results[record["task"]]
+            self.assertEqual(record["model_alias"], selected["model_alias"])
+            self.assertEqual(record["label"], selected["label"])
         rows = {row["task"]: row for row in read_rows(output / "review.jsonl")}
         self.assertIn("numeric_conflict", rows["text"]["reasons"])
         self.assertTrue(rows["text"]["proposals"][0]["recommended"])
@@ -431,7 +438,7 @@ class PipelineTest(unittest.TestCase):
         self.assertIsNone(row["priority"])
         result, = read_rows(output / "selected.jsonl")
         self.assertEqual(result["label"], "Paddle output")
-        self.assertEqual(result["reasons"], ["judge_disabled"])
+        self.assertEqual(result["reasons"], ["judge_disabled", "sole_candidate"])
 
     def test_selection_compares_distinct_transcripts_in_policy_order(self):
         def scored(label, value):

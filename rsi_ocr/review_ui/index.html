@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GlyphStack · 文档复核</title>
   <link rel="stylesheet" href="/assets/workbench.css">
-  <script src="/assets/workbench.js?v=import-summary-1" defer></script>
+  <script src="/assets/workbench.js?v=training-labels-1" defer></script>
   <script src="/assets/settings.js" defer></script>
 </head>
 <body>
@@ -21,7 +21,7 @@
       <select id="batch" hidden></select>
       <details id="export-menu" class="export-menu" hidden>
         <summary>导出</summary>
-        <div><a id="selected-download">区域自动择优结果 JSONL</a><a id="review-download">带时间戳的复核记录</a>
+        <div><a id="labels-download">最终标签 JSONL</a><a id="selected-download">区域自动择优结果 JSONL</a><a id="review-download">带时间戳的复核记录</a>
           <button type="button" id="training-download" data-export="train" hidden>SFT 训练集 JSONL</button>
           <button type="button" id="validation-download" data-export="val" hidden>SFT 验证集 JSONL</button></div>
       </details>
@@ -65,8 +65,8 @@
         <label class="visually-hidden" for="search">搜索样本</label>
         <input id="search" type="search" placeholder="搜索文档、区域或样本 ID">
           <label><span>样本范围</span><select id="scope">
-            <option value="queue">审核队列</option><option value="all">全部样本</option>
-            <option value="selection_check">择优待核对</option><option value="audit">随机抽审</option><option value="outside">未入队</option>
+            <option value="all">全部样本</option><option value="queue">抽查队列</option>
+            <option value="selection_check">择优有提示</option><option value="audit">随机抽审</option><option value="outside">未入队</option>
           </select></label>
         <details class="advanced" id="queue-filters"><summary>筛选条件<span id="filter-count"></span></summary>
           <div id="difficulty" class="segments" aria-label="难度"></div>

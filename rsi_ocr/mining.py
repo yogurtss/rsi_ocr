@@ -118,20 +118,38 @@ def choose_transcription(models, target, policy):
     choice = {"model_alias": None, "prob_yes": None, "margin": None, "status": "unavailable", "reasons": []}
     if not valid:
         return {**choice, "reasons": ["no_valid_output"]}
-    if not policy.get("judge"):
-        return {**choice, "model_alias": valid[0], "status": "needs_check", "reasons": ["judge_disabled"]}
 
     ranked = []
     partial = False
     for alias in valid:
         judge = models[alias].get("judge", {})
         score = judge.get("prob_yes")
-        if judge.get("status") == "scored" and isinstance(score, (float, int)) and 0 <= score <= 1:
+        if policy.get("judge") and judge.get("status") == "scored" and isinstance(score, (float, int)) and 0 <= score <= 1:
             ranked.append((alias, score))
         elif judge.get("status") != "precheck_reject":
             partial = True
     if not ranked:
-        return {**choice, "reasons": ["no_scored_output"]}
+        enabled = bool(policy.get("judge"))
+        pool = [alias for alias in valid if not enabled or
+                models[alias].get("judge", {}).get("status") != "precheck_reject"]
+        reasons = ["no_scored_output" if enabled else "judge_disabled"]
+        if not pool:
+            pool = valid
+            reasons = ["all_precheck_rejected"]
+        families = defaultdict(set)
+        labels = {alias: normalize(models[alias]["label"]) for alias in pool}
+        for alias, label in labels.items():
+            families[label].add(models[alias].get("family") or alias)
+        winner = max(pool, key=lambda alias: len(families[labels[alias]]))
+        support = len(families[labels[winner]])
+        tied = sum(len(group) == support for group in families.values()) > 1
+        if support > 1:
+            reasons.append("family_agreement")
+        if tied:
+            reasons.append("policy_tiebreak")
+        elif len(pool) == 1:
+            reasons.append("sole_candidate")
+        return {**choice, "model_alias": winner, "status": "selected", "reasons": reasons}
     ranked.sort(key=lambda item: item[1], reverse=True)
     winner, score = ranked[0]
     second = next((value for alias, value in ranked if models[alias]["label"] != models[winner]["label"]), None)
@@ -144,7 +162,16 @@ def choose_transcription(models, target, policy):
     if partial:
         reasons.append("partial_scores")
     return {"model_alias": winner, "prob_yes": score, "margin": margin,
-            "status": "needs_check" if reasons else "selected", "reasons": reasons}
+            "status": "selected", "reasons": reasons}
+
+
+def stored_selection(row, policy):
+    selection = row.get("selection")
+    if policy and (not selection or selection.get("reasons") in (["no_scored_output"], ["judge_disabled"])):
+        return choose_transcription(row["models"], row["target_alias"], policy)
+    if selection and selection.get("status") == "needs_check" and selection.get("model_alias"):
+        return {**selection, "status": "selected"}
+    return selection
 
 
 def selected_result(row):
@@ -152,6 +179,13 @@ def selected_result(row):
     alias = selection["model_alias"]
     return {**{key: row[key] for key in ("case_id", "doc_id", "page_id", "region_id", "task", "image_sha256")},
             **selection, "label": row["models"][alias]["label"] if alias else None}
+
+
+def automatic_label(row, selection):
+    alias = selection and selection.get("model_alias")
+    if alias:
+        return {"case_id": row["case_id"], "image_sha256": row["image_sha256"],
+                "source": "automatic", "model_alias": alias, "label": row["models"][alias]["label"]}
 
 
 class Miner:
@@ -350,6 +384,13 @@ def mine(config, manifest, output, cached_readers=False, check_cancelled=None, r
                "mining": policy,
                "services": {alias: {key: spec[key] for key in ("model", "revision")}
                             for alias, spec in miner.models.items()}}
+    from .training import batch_labels, write_training
+
+    evidence = {row["case_id"]: row for row in rows}
+    evidence_path = output / "evidence.jsonl"
+    summary["selected"] = sum(bool(row["selection"]["model_alias"]) for row in rows)
+    summary["training"] = write_training(config, evidence_path, evidence,
+                                         batch_labels(evidence, evidence_path, policy), output / "training")
     with atomic_output(output / "summary.json") as temporary:
         temporary.write_text(json_text(summary) + "\n", encoding="utf-8")
     return summary

@@ -10,7 +10,7 @@ from urllib.parse import quote
 from urllib.request import urlopen
 
 from .formats import NUMBER, edit_distance, normalize, table_cells, table_metrics
-from .mining import choose_transcription
+from .mining import stored_selection
 from .store import atomic_output, digest, json_text, read_rows, write_rows
 
 OMNI_REVISION = "aa1ee96d106dbe53d0ae59474d75c6e6d9b53fec"
@@ -261,8 +261,8 @@ def evaluate(evidence_path, reference_path, output, budget, partition, text_cer=
             continue
         if ref["image_sha256"] != row["image_sha256"]:
             raise ValueError(f"reference crop differs from evidence: {row['case_id']}")
-        if "selection" not in row and policy:
-            row["selection"] = choose_transcription(row["models"], row["target_alias"], policy)
+        if policy:
+            row["selection"] = stored_selection(row, policy)
         metrics = reference_metrics(row, ref["reference"], text_cer, table_teds)
         detail = {"case_id": row["case_id"], "task": row["task"], "reference": ref["reference"],
                   "models": metrics, "selection_gt": reference_comparison(row, metrics)}

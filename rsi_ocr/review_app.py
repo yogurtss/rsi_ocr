@@ -25,7 +25,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from rsi_ocr.benchmark import reference_comparison, reference_metrics, region_key, selection_summary
-from rsi_ocr.mining import FIXED_RULES, choose_transcription, classify, select, selected_result
+from rsi_ocr.mining import FIXED_RULES, automatic_label, stored_selection, classify, select, selected_result
 from rsi_ocr.formats import table_cells, table_metrics
 from rsi_ocr.store import digest, json_text, write_rows
 from rsi_ocr.training import paddle_sft_record
@@ -86,26 +86,31 @@ def save_decision(path, row, status, alias):
     return record
 
 
-def sft_exports(rows, records):
+def sft_exports(batch, records):
     datasets = {"train": [], "val": []}
     seen = {}
-    for record in records.values():
-        row = rows.get(record["case_id"])
-        if row is None or record["status"] != "approved":
-            continue
-        split = SFT_SPLITS.get(row.get("split", "mine"))
-        if split is None:
-            continue
-        image = verified_image(row, record)
-        sample = paddle_sft_record(image, row["task"], record["label"])
-        key = row["task"], row["image_sha256"]
-        value = split, sample["text_info"][1]["text"]
-        if key in seen:
-            if seen[key] != value:
-                raise ValueError(f"同一裁图存在分区或标注冲突（区域 {row['region_id']}）")
-            continue
-        seen[key] = value
-        datasets[split].append(sample)
+    with evidence_stream(batch) as stream:
+        for row in batch["rows"].values():
+            record = records.get(row["case_id"])
+            if record and record["status"] != "approved":
+                continue
+            if not record:
+                if not row["selection"].get("model_alias") or row.get("split", "mine") not in SFT_SPLITS:
+                    continue
+                record = automatic_label(evidence_row(stream, row), row["selection"])
+            split = SFT_SPLITS.get(row.get("split", "mine"))
+            if split is None:
+                continue
+            image = verified_image(row, record)
+            sample = paddle_sft_record(image, row["task"], record["label"])
+            key = row["task"], row["image_sha256"]
+            value = split, sample["text_info"][1]["text"]
+            if key in seen:
+                if seen[key] != value:
+                    raise ValueError(f"同一裁图存在分区或标注冲突（区域 {row['region_id']}）")
+                continue
+            seen[key] = value
+            datasets[split].append(sample)
     return datasets
 
 
@@ -246,8 +251,7 @@ def read_batch(run, evaluation, title, report=None):
         entry = {key: row[key] for key in ("case_id", "doc_id", "page_id", "region_id", "task", "image", "page_image",
                  "image_sha256", "split", "priority", "reasons", "audit_sample", "hard_case", "signals",
                  "target_operational_error", "selection") if key in row}
-        if "selection" not in entry:
-            entry["selection"] = choose_transcription(row["models"], row["target_alias"], summary["mining"])
+        entry["selection"] = stored_selection(row, summary.get("mining"))
         entry["_offset"] = offset
         entry["valid_target"] = bool(target.get("label"))
         judge = target.get("judge", {})
@@ -631,7 +635,9 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                    ("case_id", "doc_id", "page_id", "region_id", "task", "priority", "reasons", "audit_sample", "hard_case")},
                 "operational": bool(row.get("target_operational_error")),
                 "valid_target": row["valid_target"],
+                "automatic_model": row["selection"]["model_alias"],
                 "selection_status": row["selection"]["status"],
+                "selection_flagged": bool(row["selection"].get("reasons")),
                 "queued": case_id in batch["queue"], "judge_status": target.get("judge", {}).get("status"),
                 "review_status": recorded.get(case_id, "pending"),
                 "target_error": detail.get("target_error"), "repairable": detail.get("repairable"),
@@ -673,7 +679,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                     continue
                 if db.execute("SELECT 1 FROM decisions WHERE case_id=?", (key,)).fetchone():
                     continue
-                if row["selection"]["status"] != "selected":
+                if row["selection"]["status"] != "selected" or row["selection"].get("reasons"):
                     continue
                 try:
                     record = decision_record(evidence_row(stream, row), "approved", row["selection"]["model_alias"])
@@ -766,16 +772,31 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         return geometry
 
     @app.get("/api/batches/{batch_id}/export/selected")
-    def export_selected(batch_id: str):
+    def export_selected(batch_id: str, final: bool = False):
         batch = original_batch(batch_id)
+        overrides = decisions(batch["path"] / "review.sqlite") if final else {}
+
         def records():
             with evidence_stream(batch) as stream:
                 for entry in batch["rows"].values():
-                    yield json_text(selected_result(evidence_row(stream, entry))) + "\n"
+                    result = selected_result(evidence_row(stream, entry))
+                    if final:
+                        decision = overrides.get(entry["case_id"])
+                        if decision:
+                            if decision["status"] != "approved":
+                                continue
+                            result.update(label=decision["label"], model_alias=decision["model_alias"],
+                                          source=decision["source"], status="approved", margin=None,
+                                          prob_yes=None, reasons=[])
+                        elif result["model_alias"]:
+                            result["source"] = "automatic"
+                        else:
+                            continue
+                    yield json_text(result) + "\n"
 
         return StreamingResponse(records(),
                                  media_type="application/x-ndjson",
-                                 headers={"Content-Disposition": 'attachment; filename="selected.jsonl"'})
+                                 headers={"Content-Disposition": "attachment; filename=" + ("labels.jsonl" if final else "selected.jsonl")})
 
     @app.get("/api/batches/{batch_id}/export/review")
     def export_decisions(batch_id: str):
@@ -793,11 +814,11 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
             raise HTTPException(404, "导出分区不存在")
         batch = get_batch(batch_id)
         try:
-            samples = sft_exports(batch["rows"], decisions(batch["path"] / "review.sqlite"))[split]
+            samples = sft_exports(batch, decisions(batch["path"] / "review.sqlite"))[split]
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
         if not samples:
-            raise HTTPException(409, "该分区还没有通过复核的训练样本")
+            raise HTTPException(409, "该分区没有可导出的有效标签")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         path = batch["path"] / "sft_exports" / f"sft_{split}_{stamp}.jsonl"
         write_rows(path, samples)

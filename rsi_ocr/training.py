@@ -1,9 +1,13 @@
+import json
 import os
+import sqlite3
+from contextlib import closing
 import subprocess
 from pathlib import Path
 
 from .config import expand
 from .formats import table_cells, table_html, table_otsl
+from .mining import automatic_label, stored_selection
 from .reward import validate_weights
 from .store import digest, json_text, read_rows, write_rows
 
@@ -21,18 +25,42 @@ def paddle_sft_record(image, task, label):
     raise ValueError(f"unsupported PaddleOCR-VL task: {task}")
 
 
+def batch_labels(evidence, evidence_path, policy):
+    database = evidence_path.with_name("review.sqlite")
+    overrides = {}
+    if database.is_file():
+        with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            overrides = {key: json.loads(value) for key, value in db.execute("SELECT case_id, payload FROM decisions")}
+    for key, row in evidence.items():
+        if key in overrides:
+            if overrides[key]["status"] == "approved":
+                yield overrides[key]
+        elif record := automatic_label(row, stored_selection(row, policy)):
+            yield record
+
+
 def export_training(config, evidence_path, review_path, output):
     evidence = {row["case_id"]: row for row in read_rows(evidence_path)}
+    if review_path is None:
+        summary = evidence_path.with_name("summary.json")
+        policy = json.loads(summary.read_bytes()).get("mining", config["mining"]) if summary.is_file() else config["mining"]
+        reviews = batch_labels(evidence, evidence_path, policy)
+    else:
+        reviews = read_rows(review_path)
+    return write_training(config, evidence_path, evidence, reviews, output, reviewed_only=review_path is not None)
+
+
+def write_training(config, evidence_path, evidence, reviews, output, *, reviewed_only=False):
     target = config["models"][config["mining"]["target"]]
     grouped = {"train": [], "val": []}
     seen = {}
     decisions = set()
-    for review in read_rows(review_path):
+    for review in reviews:
         case_id = review["case_id"]
         if case_id in decisions:
             raise ValueError(f"duplicate review decision: {case_id}")
         decisions.add(case_id)
-        if review["status"] != "approved":
+        if reviewed_only and review["status"] != "approved":
             continue
         row = evidence[case_id]
         if row.get("split") == "benchmark":
@@ -67,7 +95,8 @@ def export_training(config, evidence_path, review_path, output):
         ))
     write_rows(output / "training_manifest.jsonl", (
         {"case_id": row["case_id"], "image_sha256": row["image_sha256"], "image": image, "split": split,
-         "doc_id": row["doc_id"], "task": row["task"], "source": review["source"], "label": solution}
+         "doc_id": row["doc_id"], "page_id": row.get("page_id"), "region_id": row.get("region_id"),
+         "task": row["task"], "source": review["source"], "model_alias": review.get("model_alias"), "label": solution}
         for split, rows in grouped.items() for row, review, image, _, _, solution in rows
     ))
     return {split: len(rows) for split, rows in grouped.items()}

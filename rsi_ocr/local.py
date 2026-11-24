@@ -277,7 +277,8 @@ def run_local(config, output, jobs, pages=None, stage="all", session=None, progr
                 summary = mine(config, manifest, run, cached_readers=True, check_cancelled=check_cancelled,
                                resume=resume, report_work=report_work)
                 if progress:
-                    progress(f"筛选完成 · 扫描 {summary['scanned']} 个区域 · {summary['review']} 个待复核")
+                    progress(f"自动择优 {summary['selected']}/{summary['scanned']} 个区域 · "
+                             f"训练 {summary['training']['train']} 条 · 验证 {summary['training']['val']} 条 · {run / 'training'}")
                 else:
                     print(f"{run.name} {json_text(summary)}", flush=True)
             if resume:

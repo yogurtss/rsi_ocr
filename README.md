@@ -198,7 +198,7 @@ glyphstack stop all --port 8520            # 命令行卸载全部模型
 | PDF 逐页渲染，图片直接复制；记录相对文件名和页号 | `input/pages.jsonl`、`input/pages/` |
 | Paddle 做版面检测并识别，保存实际送入识别器的裁图 | `capture/regions.jsonl`、`capture/crops/` |
 | OXR、OvisOCR3 各自识别同一裁图，Jev 对每份有效转录评分。按需模式轮换占用 GPU，常驻模式并行运行两个教师模型 | `production/evidence.jsonl` 保存三模型结果、分数和判定信号 |
-| 每个区域取 Jev 成功评分的最高分转录，覆盖全部已处理区域 | `production/selected.jsonl` 每行记录文档、页、区域、采用模型、转录、得分、与下一份不同转录的分差及状态 |
+| 逐区域自动选取转录，优先取 Jev 最高分，无分时按模型家族共识择优 | `production/selected.jsonl` 每行记录文档、页、区域、采用模型、转录、得分、与下一份不同转录的分差及状态 |
 | 规则标记难例，按排序分、配额和随机抽检形成审核队列 | `production/review.jsonl`、`production/summary.json` |
 
 只有页图和清单需求时可用 `rsi-ocr run /data/inbox --import-only`。如需排查推理失败，查看批次根目录中对应模型的 `.log`。
@@ -213,6 +213,8 @@ glyphstack stop all --port 8520            # 命令行卸载全部模型
 
 ## 复核与导出
 
+完整批次会自动在 `production/training/` 生成 SFT 和 GRPO 数据。直接使用 `sft_train.jsonl` 或 `grpo_train.jsonl` 训练，对应的 `*_val.jsonl` 使用输入中标为 val 的样本。`training_manifest.jsonl` 逐条列出实际入集的裁图、文档、页、区域、采用模型、标签和来源；`production/selected.jsonl` 保留所有区域的自动择优结果。批次完成日志和 Studio 总览显示训练与验证条数。后续在 Studio 改选或驳回后，可重新导出以更新训练数据。
+
 大批次首次导入时，进度条显示当前文件名、已读记录数、字节进度和该文件的完成百分比。传输样本目录时，进度按已接收区域数显示。同一个 Studio 进程再次打开未变更的批次会复用索引。样本目录每页显示 100 个区域，搜索和筛选覆盖整个批次，点开样本时才读取完整模型输出。
 
 日常批次按无 GT（人工参考标注）运行。区域择优使用 OCR 候选和 Jev 评分，难例入队使用模型分歧、风险规则、配额和抽检。提供 GT 时，Studio 在结果生成后单独对照参考标注，自动选择、队列和导出结果均沿用原批次。
@@ -220,9 +222,9 @@ glyphstack stop all --port 8520            # 命令行卸载全部模型
 有部分或全部区域的 GT 时，可在批次的 `input/references.jsonl` 中按区域写入 `doc_id`、`page_id`、`region_id`、`task`、`image_sha256` 和 `reference`（文字转录或表格 HTML），然后重新导入批次。前五项可从 `production/selected.jsonl` 复制。复核页显示自动所选模型和最接近 GT 的模型，文字按字符错误率 CER 取最低，表格按 TEDS 取最高，同分并列。总览显示有 GT 的区域数，以及至少两个有效候选且有自动选择的区域中有多少命中最近候选。
 
 - **看结果**。文字和表格默认显示整页原图、区域裁图和选中的转录，点「下一条」即可连续浏览。点击图片可放大、拖动，原页框标出当前区域。打开有人工记录的区域时会恢复上次复核所选模型。
-- **看择优依据**。相同转录只占一个名次。同分优先保留 Paddle，再按教师配置顺序选择。最高分低于 `mining.proposal_judge`（默认 0.90）、不同转录分差低于 `mining.selection_margin`（默认 0.05）、并列最高或部分候选评分失败时，保留最高分转录并标记待核对。全部评分失败或预检拒绝时，转录留空。关闭 Jev 时按顺序保留首份有效转录并标记待核对。可用「样本范围 → 择优待核对」集中查看。
+- **看择优依据**。相同转录只占一个名次。同分优先保留 Paddle，再按教师配置顺序选择。最高分低于 `mining.proposal_judge`（默认 0.90）、不同转录分差低于 `mining.selection_margin`（默认 0.05）、并列最高或部分候选评分失败时，直接采用最高分转录并记录择优依据。没有可用分数或关闭 Jev 时，按支持同一转录的不同模型家族数择优（比较时归一化空白），并列时按上述模型顺序选择。有其他有效候选时排除预检拒绝项，全部被拒绝时也保留一份候选。这些自动标签同样直接采用，得分留空。只有全部 OCR 候选为空或无效时才没有转录。可用「样本范围 → 择优有提示」集中查看。
 - **按需复核**。展开「各模型转录与判定依据」可对照差异或改选模型。点 **确认通过** 保存人工确认，点 **驳回** 标记错误。展开「筛选条件」并选择「非难例」可批量确认其中通过择优质量筛查的结果，支持撤销。
 - **取自动结果**。批次结束即生成 `production/selected.jsonl`，也可从 Studio 顶部「导出 → 区域自动择优结果 JSONL」下载。旧批次直接用已保存的评分生成下载内容。
-- **导出**。审核决定写入 `production/review.sqlite`。顶部「导出」生成带 UTC 时间戳的 SFT JSONL，保存在 `production/sft_exports/`。图片路径指向批次裁图，表格答案采用 OTSL。[PaddleOCR‑VL 官方数据格式](https://github.com/PaddlePaddle/ERNIE/blob/release/v1.5/docs/paddleocr_vl_sft_zh.md)
+- **导出**。审核决定写入 `production/review.sqlite`。无需打开 Studio 或逐条确认，批次结束即可使用自动标签。命令行运行 `rsi-ocr export runs/批次名/production/evidence.jsonl --out training` 可导出 SFT 和 GRPO 数据，已有 Studio 筛查记录时会采用人工改选并跳过驳回项；显式传入复核记录文件时仅导出文件中已通过的样本。Studio 顶部「导出 → 最终标签 JSONL」和 SFT 导出默认采用自动标签，人工改选的区域采用确认后的标签，驳回的区域跳过。导出生成带 UTC 时间戳的 SFT JSONL，保存在 `production/sft_exports/`。图片路径指向批次裁图，表格答案采用 OTSL。[PaddleOCR‑VL 官方数据格式](https://github.com/PaddlePaddle/ERNIE/blob/release/v1.5/docs/paddleocr_vl_sft_zh.md)
 
 已有 OmniDocBench 批次、区域清单或独立模型服务，可参阅[基准评测和分步命令](docs/advanced.md)。
