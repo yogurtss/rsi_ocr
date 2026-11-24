@@ -91,6 +91,7 @@ glyphstack status --port 8520                 # 查看模型和任务状态
 | OXR 无法注册或 Ovis 缺提示文件 | 确认已安装 `OXR-1.0/plugins/vllm`，并确认 Ovis 权重目录中存在 `prompts/plain_ocr.txt`。 |
 | Jev 找不到 `sdk/app.py` | 新版默认从安装包加载 SDK。确认 Console 使用的是新版，再检查自用 YAML 中的 `deployment.minicpm_repo`。配置中删掉该覆盖项即可使用内置 SDK。 |
 | Jev 引擎启动后渲染仍失败 | 看 `jev-render.log`，检查 Node.js、Chromium 的安装路径、系统库和 CJK 字体。 |
+| Jev 报 `No available memory for the cache blocks` | 看 `jev.log`。可先在 `deployment.models.jev` 中设置 `max_sequences: 4` 以降低启动时的显存需求，然后重启 Console。 |
 | CUDA 显存不足 | 保持串行按需模式，核对卡上其他进程、`gpu_memory` 和模型的 `max_sequences`。 |
 
 ## 模型控制台
