@@ -1,6 +1,6 @@
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from itertools import islice
+from itertools import combinations, islice
 from pathlib import Path
 
 from .formats import NUMBER, normalize, similarity, table_cells, table_html, table_metrics
@@ -112,7 +112,7 @@ def proposals(case, inputs, target_alias, policy):
                                            row["judge"].get("prob_yes") or 0), reverse=True)
 
 
-def choose_transcription(models, target, policy):
+def choose_transcription(models, target, policy, task="text"):
     order = dict.fromkeys([target, *policy.get("teachers", []), *sorted(models)])
     valid = [key for key in order if key in models and models[key].get("status") == "ok" and models[key].get("label")]
     choice = {"model_alias": None, "prob_yes": None, "margin": None, "status": "unavailable", "reasons": []}
@@ -128,6 +128,15 @@ def choose_transcription(models, target, policy):
             ranked.append((alias, score))
         elif judge.get("status") != "precheck_reject":
             partial = True
+    # A failed request is missing evidence. Only a score or a precheck verdict
+    # can establish that Jev assessed a candidate.
+    if (policy.get("judge") and len(valid) >= 2 and not partial
+            and all(score <= policy["low_judge"] for _, score in ranked)):
+        threshold = policy["disagreement"]
+        labels = [models[alias]["label"] for alias in valid]
+        distances = (compare(task, left, right)[0] for left, right in combinations(labels, 2))
+        if all(distance > 0 and distance >= threshold for distance in distances):
+            return {**choice, "status": "needs_choice", "reasons": ["disagree_without_judge_support"]}
     if not ranked:
         enabled = bool(policy.get("judge"))
         pool = [alias for alias in valid if not enabled or
@@ -167,8 +176,11 @@ def choose_transcription(models, target, policy):
 
 def stored_selection(row, policy):
     selection = row.get("selection")
-    if policy and (not selection or selection.get("reasons") in (["no_scored_output"], ["judge_disabled"])):
-        return choose_transcription(row["models"], row["target_alias"], policy)
+    reasons = set(selection.get("reasons", [])) if selection else set()
+    if policy and (not selection or reasons.intersection({"no_scored_output", "judge_disabled", "low_score",
+                                                          "all_precheck_rejected"})
+                   or (selection.get("prob_yes") is not None and selection["prob_yes"] <= policy["low_judge"])):
+        return choose_transcription(row["models"], row["target_alias"], policy, row["task"])
     if selection and selection.get("status") == "needs_check" and selection.get("model_alias"):
         return {**selection, "status": "selected"}
     return selection
@@ -231,7 +243,7 @@ class Miner:
         return {**{key: value for key, value in case.items() if key != "target"},
                 "case_id": case_id, "image_sha256": image_hash, "image": str(path), "models": inputs,
                 "target_alias": target, **evidence(case, inputs, target, self.policy),
-                "selection": choose_transcription(inputs, target, self.policy),
+                "selection": choose_transcription(inputs, target, self.policy, task),
                 "proposals": proposals(case, inputs, target, self.policy)}
 
 
@@ -388,6 +400,7 @@ def mine(config, manifest, output, cached_readers=False, check_cancelled=None, r
 
     evidence = {row["case_id"]: row for row in rows}
     evidence_path = output / "evidence.jsonl"
+    summary["needs_choice"] = sum(row["selection"]["status"] == "needs_choice" for row in rows)
     summary["selected"] = sum(bool(row["selection"]["model_alias"]) for row in rows)
     summary["training"] = write_training(config, evidence_path, evidence,
                                          batch_labels(evidence, evidence_path, policy), output / "training")

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GlyphStack · 文档复核</title>
   <link rel="stylesheet" href="/assets/workbench.css">
-  <script src="/assets/workbench.js?v=training-labels-1" defer></script>
+  <script src="/assets/workbench.js?v=human-choice-1" defer></script>
   <script src="/assets/settings.js" defer></script>
 </head>
 <body>
@@ -66,7 +66,7 @@
         <input id="search" type="search" placeholder="搜索文档、区域或样本 ID">
           <label><span>样本范围</span><select id="scope">
             <option value="all">全部样本</option><option value="queue">抽查队列</option>
-            <option value="selection_check">择优有提示</option><option value="audit">随机抽审</option><option value="outside">未入队</option>
+            <option value="needs_choice">待人工选模</option><option value="selection_check">择优有提示</option><option value="audit">随机抽审</option><option value="outside">未入队</option>
           </select></label>
         <details class="advanced" id="queue-filters"><summary>筛选条件<span id="filter-count"></span></summary>
           <div id="difficulty" class="segments" aria-label="难度"></div>

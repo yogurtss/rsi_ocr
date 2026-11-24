@@ -440,6 +440,20 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result["label"], "Paddle output")
         self.assertEqual(result["reasons"], ["judge_disabled", "sole_candidate"])
 
+    def test_abstain_only_on_pairwise_disagreement_and_explicit_negative_judgments(self):
+        policy = self.config["mining"]
+        models = {key: {"status": "ok", "label": label,
+                        "judge": {"status": "scored", "prob_yes": policy["low_judge"]}}
+                  for key, label in [("paddle", "alpha"), ("oxr", "bravo"), ("ovis", "delta")]}
+        models["ovis"]["judge"] = {"status": "precheck_reject"}
+        held = choose_transcription(models, "paddle", policy)
+        self.assertEqual((held["status"], held["model_alias"]), ("needs_choice", None))
+        models["oxr"]["label"] = "alpha"
+        self.assertEqual(choose_transcription(models, "paddle", policy)["status"], "selected")
+        models["oxr"]["label"] = "bravo"
+        models["ovis"]["judge"] = {"status": "service_error"}
+        self.assertEqual(choose_transcription(models, "paddle", policy)["status"], "selected")
+
     def test_selection_compares_distinct_transcripts_in_policy_order(self):
         def scored(label, value):
             return {"status": "ok", "label": label, "judge": {"status": "scored", "prob_yes": value}}

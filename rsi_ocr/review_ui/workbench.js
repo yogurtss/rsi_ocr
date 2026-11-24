@@ -8,6 +8,7 @@ const names = {paddle: "PaddleOCR‑VL", oxr: "OXR‑1.0", ovis: "OvisOCR3", jev
 const tasks = {text: "文字", table: "表格"};
 const selectionReasons = {low_score: "最高分偏低", close_scores: "不同转录的分数接近",
   partial_scores: "部分候选评分失败", judge_disabled: "Jev 已关闭",
+  disagree_without_judge_support: "各候选转录两两分歧，Jev 均为低分或预检拒绝",
   no_valid_output: "没有有效转录", no_scored_output: "Jev 未返回可用分数",
   all_precheck_rejected: "全部候选被 Jev 预检拒绝", family_agreement: "多个模型家族转录一致",
   policy_tiebreak: "支持数并列，按配置顺序选择", sole_candidate: "仅有一份可选转录"};
@@ -108,7 +109,7 @@ function renderQueue() {
     const selected = state.current === row.case_id;
     const title = row.doc_id.split("/").pop();
     const status = row.review_status !== "pending" ? statuses[row.review_status] :
-      row.selection_status === "selected" ? nameOf(row.automatic_model) + " · 自动选定" : "无有效转录";
+      row.selection_status === "selected" ? nameOf(row.automatic_model) + " · 自动选定" : row.selection_status === "needs_choice" ? "待人工选模" : "无有效转录";
     return `<button class="queue-item ${selected ? "selected" : ""}" data-case="${esc(row.case_id)}"
       aria-current="${selected}" title="${esc(row.doc_id)} · ${esc(row.region_id)}">
       <strong>${esc(title)}</strong><span class="queue-meta"><span class="row-detail">页 ${esc(row.page_id)} · 区域 ${esc(row.region_id)} · ${esc(tasks[row.task] || row.task)}</span>
@@ -145,6 +146,7 @@ function filterQueue() {
   state.rows = state.data.rows.filter(row => (
     (state.level === "all" || difficultyOf(row) === state.level) &&
     (scope === "all" || (scope === "queue" && row.queued) || (scope === "audit" && row.audit_sample)
+      || (scope === "needs_choice" && row.selection_status === "needs_choice" && row.review_status === "pending")
       || (scope === "selection_check" && row.selection_flagged)
       || (scope === "outside" && !row.queued))
     && (state.task === "all" || row.task === state.task)
@@ -540,6 +542,7 @@ function renderComparison() {
   const automatic = selection.model_alias;
   const adopted = row.decision?.status === "approved" ? row.decision.model_alias : automatic;
   const heading = row.decision?.status === "rejected" ? "已驳回 · 候选转录" :
+    !alias && selection.status === "needs_choice" ? "请选择模型转录" :
     alias === adopted || !alias ? "采用的 OCR 标签" : "候选转录预览";
   q("#selection-heading").textContent = heading;
   q("#selection-model").textContent = alias ? nameOf(alias) : "";
@@ -552,7 +555,9 @@ function renderComparison() {
   q("#selection-detail").textContent = details.join("　");
   q("#selection-detail").classList.toggle("needs-attention", selection.reasons.length > 0);
   const preview = row.baseline_views[alias];
-  q("#selection-output").innerHTML = alias ? output(model.label, preview, false) : '<p class="output-empty">没有有效的 OCR 转录</p>';
+  q("#selection-output").innerHTML = alias ? output(model.label, preview, false) : selection.status === "needs_choice"
+    ? '<p class="output-empty">请对照裁图选择一份转录。若全部有误，可驳回此样本。</p>'
+    : '<p class="output-empty">没有有效的 OCR 转录</p>';
   if (row.task === "table") {
     q("#selection-table").hidden = !preview?.rows;
     q("#selection-table").textContent = `查看完整表格 · ${preview?.rows?.length || 0} 行 × ${sheetWidth(preview)} 列`;
@@ -639,7 +644,7 @@ function renderCase() {
     <div class="case-header">
       <div class="case-heading">
         <div class="case-eyebrow"><span class="task-chip">${esc(tasks[row.task])}</span>
-          <span class="case-status ${esc(stateLabel)}">${esc(decision ? statuses[stateLabel] : row.selection.model_alias ? "已自动选定" : "无有效转录")}</span>
+          <span class="case-status ${esc(stateLabel)}">${esc(decision ? statuses[stateLabel] : row.selection.model_alias ? "已自动选定" : row.selection.status === "needs_choice" ? "待人工选模" : "无有效转录")}</span>
           ${listed?.target_error ? '<span class="case-status incorrect">Paddle 有误</span>' : ""}
           ${listed?.repairable ? '<span class="case-status correct">有正确替代</span>' : ""}</div>
         <h2 title="${esc(row.doc_id)}">${esc(row.doc_id.split("/").pop())}</h2>
@@ -667,9 +672,9 @@ function renderCase() {
         <p class="selection-detail" id="selection-detail"></p>
         ${referenceVerdict(row.selection_gt)}
       </section>
-      <details class="panel inspection-details" id="comparison-details"><summary>各模型转录与判定依据</summary>
+      <details class="panel inspection-details" id="comparison-details" ${row.selection.status === "needs_choice" && !decision ? "open" : ""}><summary>各模型转录与判定依据</summary>
         <div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset>
-          <label>人工采用<select id="adopt-model"><option value="" disabled>选择转录</option>${Object.keys(row.models).map(key =>
+          <label>人工采用<select id="adopt-model"><option value="" disabled>选择转录</option>${Object.keys(row.models).filter(key => row.models[key].label).map(key =>
             `<option value="${esc(key)}">${esc(nameOf(key))} · ${number(row.models[key].judge?.prob_yes)}</option>`).join("")}</select></label></div>
         <section class="decision-summary">
           <div><h3>${listed?.queued ? (row.audit_sample ? "随机抽检入队" : "难例入队") : "未入审核队列"} · 判定依据</h3><div class="chips">${badges}</div>${evidenceDetails(row)}</div>
@@ -720,7 +725,7 @@ function changeCase(offset) {
 }
 
 async function saveReview(status) {
-  if (state.saving) return;
+  if (state.saving || (status === "approved" && !state.case?.models[state.compare]?.label)) return;
   const path = casePath();
   const row = state.rows.find(item => item.case_id === state.current);
   const next = state.rows.slice(state.rows.indexOf(row) + 1).find(item => item.review_status === "pending")
@@ -892,7 +897,7 @@ function renderOverview() {
   const scores = summary.judge_status;
   const totalScores = Object.values(scores).reduce((sum, count) => sum + count, 0);
   const cards = [["区域总数", rows.length], ["规则命中", summary.hard_cases], ["已自动选定", rows.filter(row => row.selection_status === "selected").length],
-    ["已完成复核", reviewed], ["Jev 有效评分率", totalScores ? percent((scores.scored || 0) / totalScores) : "—"]];
+    ["待人工选模", rows.filter(row => row.selection_status === "needs_choice" && row.review_status === "pending").length], ["已完成复核", reviewed], ["Jev 有效评分率", totalScores ? percent((scores.scored || 0) / totalScores) : "—"]];
   if (summary.training) cards.push(["批次训练集", summary.training.train], ["批次验证集", summary.training.val]);
   const counts = {};
   rows.forEach(row => row.reasons.forEach(key => { counts[key] = (counts[key] || 0) + 1; }));
