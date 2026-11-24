@@ -27,7 +27,7 @@ PLAYWRIGHT_BROWSERS_PATH="$PWD/runs/playwright" python -m playwright install --w
 
 ### 2. GPU 版面检测
 
-上一步安装的 `paddlepaddle` 用于默认的 CPU 版面检测。如果要在「模型部署 → 版面检测」选择 GPU，请在运行 Console 的同一个 Conda 环境中把 CPU 版替换成支持 CUDA 的 `paddlepaddle-gpu`。下面以 CUDA 12.6 为例，其他 CUDA 版本请按官方说明选择安装包。[PaddlePaddle GPU 安装说明](https://paddlepaddle.github.io/FastDeploy/get_started/installation/nvidia_gpu/)
+上一步安装的 `paddlepaddle` 用于默认的 CPU 版面检测。如果要在「模型部署 → 版面检测」选择 GPU，请在运行 Console 的同一个 Conda 环境中把 CPU 版替换成支持 CUDA 的 `paddlepaddle-gpu`。下面的安装命令以 CUDA 12.6 为例。[PaddlePaddle GPU 安装说明](https://paddlepaddle.github.io/FastDeploy/get_started/installation/nvidia_gpu/)
 
 ```bash
 conda activate "$PWD/runs/conda"
@@ -36,7 +36,12 @@ python -m pip install 'paddlepaddle-gpu==3.3.1' \
   -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 ```
 
-已运行的 Console 需要重启。继续使用 CPU 版面检测时可跳过本节。
+**Python 3.12 + CUDA 13.0** 的 PaddlePaddle GPU 3.3.1 官方 wheel：
+
+- Linux / WSL2（x86_64）：[paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl](https://paddle-whl.cdn.bcebos.com/stable/cu130/paddlepaddle-gpu/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl)
+- 原生 Windows（x64）：[paddlepaddle_gpu-3.3.1-cp312-cp312-win_amd64.whl](https://paddle-whl.cdn.bcebos.com/stable/cu130/paddlepaddle-gpu/paddlepaddle_gpu-3.3.1-cp312-cp312-win_amd64.whl)
+
+使用直链时，卸载 CPU 版后，在同一环境运行 `python -m pip install <下载的 .whl 路径>`。安装完成后重启已运行的 Console。继续使用 CPU 版面检测时可跳过本节。
 
 ### 3. 下载模型
 
