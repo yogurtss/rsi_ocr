@@ -320,6 +320,10 @@ dialog::backdrop { background: #101b34bb; }
 #import-path-status { color:#a13928; overflow-wrap:anywhere; }
 #import-path-status:empty { display:none; }
 #import-load { justify-self:end; }
+.import-progress { display:grid; gap:7px; margin:8px 0; font-size:.87rem; }
+.import-progress progress { width:100%; accent-color:var(--blue); }
+#queue-pages { display:flex; justify-content:space-between; align-items:center; gap:4px; padding:6px 12px; font-size:.8rem; }
+#queue-pages button { padding:4px 7px; }
 #import-count { display:inline-block; padding:2px 7px; border-radius:5px; background:#e5e4f4; color:#514986;
   font:600 .76rem "IBM Plex Mono",monospace; vertical-align:middle; }
 .library-tools input { width:min(17rem,43%); min-width:0; }

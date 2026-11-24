@@ -37,6 +37,7 @@
         <input type="search" id="import-search" aria-label="搜索批次或文件名" placeholder="搜索批次或文件名" hidden>
         <button id="import-refresh">刷新</button></div>
       <p id="import-message" role="status">正在读取批次…</p>
+      <div class="import-progress" id="card-progress" hidden><span role="status"></span><progress aria-label="批次读取进度"></progress></div>
       <div id="import-list"></div>
       <button type="button" id="import-more" hidden></button>
       <footer id="import-root"></footer>
@@ -51,6 +52,7 @@
              required autofocus autocomplete="off" spellcheck="false" aria-describedby="import-path-hint">
       <small id="import-path-hint">可填批次目录或其 production 子目录。相对路径从后台配置的结果目录开始。</small>
       <p id="import-path-status" role="status"></p>
+      <div class="import-progress" id="path-progress" hidden><span role="status"></span><progress aria-label="批次读取进度"></progress></div>
       <button type="submit" class="primary" id="import-load">加载</button>
     </form>
   </dialog>
@@ -90,6 +92,8 @@
         <button id="bulk" hidden></button><button id="undo" hidden>撤销上次批量通过</button>
       </div>
       <div id="queue-list" class="queue-list"></div>
+      <nav id="queue-pages" aria-label="样本目录分页" hidden><button id="queue-prev-page">上一页</button>
+        <span></span><button id="queue-next-page">下一页</button></nav>
     </aside>
     <div class="queue-rail">
       <button id="queue-toggle" type="button" aria-controls="sample-queue" aria-expanded="true" aria-label="收起队列" title="收起队列">‹</button>

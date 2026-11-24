@@ -320,6 +320,10 @@ def configure_models(config, root, minicpm=None, deployment=None):
     config["layout"] = {"path": layout_path.strip(), "device": layout_device}
     models = config["models"]
     models["paddle"]["revision"] = "PaddleOCR-VL-1.6-local"
+    page_window = model_options.get("paddle", {}).get("page_window", 4)
+    if type(page_window) is not int or page_window < 1:
+        raise ValueError("deployment.models.paddle.page_window 须为正整数")
+    models["paddle"]["page_window"] = page_window
     models["oxr"]["revision"] = "OXR-1.0-c708407f"
     models["ovis"]["revision"] = "OvisOCR3-5b252386"
     models["jev"]["revision"] = "MiniCPM-OCR-Jev-a0ed278e"

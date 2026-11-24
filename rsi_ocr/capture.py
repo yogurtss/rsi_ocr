@@ -7,11 +7,12 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from time import monotonic
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import get_context
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Lock, Thread
 
 from .config import expand
@@ -46,8 +47,8 @@ def locate_crops(image, boxes, root, rows):
 
 
 class Recorder:
-    def __init__(self, target, root):
-        self.service = Service(target)
+    def __init__(self, target, root, service=None):
+        self.service = service if service is not None else Service(target)
         self.root = root
         self.by_prompt = {spec["prompt"]: (task, spec["format"]) for task, spec in target["tasks"].items()}
         self.lock = Lock()
@@ -403,7 +404,7 @@ def capture_gpu_pages(config, manifest, root, progress=None, check_cancelled=Non
 @contextmanager
 def prepared_layout(inner, source, result):
     """Replay one native detection only for the same unmodified page array."""
-    original = inner.layout_det_model
+    original = getattr(inner, "layout_det_model", None)
 
     def detect(images, **kwargs):
         if len(images) != 1 or images[0] is not source:
@@ -421,11 +422,17 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                   check_cancelled=None, report_work=None):
     root.mkdir(parents=True, exist_ok=True)
     target = config["models"][config["mining"]["target"]]
-    recorder = Recorder(target, root)
+    upstream = Service(target)
     options = config["capture"]
 
-    def create_pipeline(url):
-        device = options.get("pipeline", {}).get("device", "cpu")
+    def create_client(resources, *, recognition_only=False):
+        recorder = Recorder(target, root, upstream)
+        url = resources.enter_context(recorder.listen())
+        pipeline_options = {"vl_rec_max_concurrency": target.get("concurrency", 4), **options.get("pipeline", {})}
+        if recognition_only:
+            pipeline_options.update(use_layout_detection=False, use_doc_orientation_classify=False,
+                                    use_doc_unwarping=False, device="cpu")
+        device = pipeline_options.get("device", "cpu")
         if str(device).partition(":")[0] == "gpu":
             import paddle
 
@@ -434,11 +441,14 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
 
         from paddleocr import PaddleOCRVL
 
-        pipeline_options = {"vl_rec_max_concurrency": target.get("concurrency", 4), **options.get("pipeline", {})}
-        return PaddleOCRVL(
+        pipeline = PaddleOCRVL(
             **pipeline_options, vl_rec_backend="vllm-server", vl_rec_server_url=url,
             vl_rec_api_model_name=target["model"], vl_rec_api_key="capture-local",
         )
+        if callable(getattr(pipeline, "close", None)):
+            resources.callback(pipeline.close)
+        px = getattr(pipeline, "paddlex_pipeline", None)
+        return pipeline, getattr(px, "_pipeline", px), recorder
 
     if plan is None:
         plan = capture_plan(config, manifest, root, check_cancelled)
@@ -449,6 +459,7 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
     done = 0
     state_lock = Lock()
     active = {}
+    recognizing = set()
     mode = "逐页"
 
     def update(entry, phase, **values):
@@ -460,15 +471,17 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
             elif phase == "准备版面":
                 active["layout_page"] = current
             elif phase == "区域识别":
-                active["ocr_page"] = current
+                recognizing.add(current)
                 if active.get("layout_page") == current:
                     active.pop("layout_page")
             elif phase == "整页已保存":
                 done += 1
-                active.pop("ocr_page", None)
+            if phase in ("整页已保存", "区域服务错误"):
+                recognizing.discard(current)
             if report_page:
                 report_page({"current": current, "phase": phase, "done": done, "total": len(plan),
-                             "reused": reused, "mode": mode, **active, **values})
+                             "reused": reused, "mode": mode, "ocr_pages": len(recognizing),
+                             "ocr_page": next(iter(recognizing), None), **active, **values})
 
     def checkpoint(entry, detector, times):
         def layout_ready(cached, seconds):
@@ -479,7 +492,8 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
 
         return layout_checkpoint(detector, entry.shard, layout_ready)
 
-    def recognize(entry, source, detector, prepared, times, started):
+    def recognize(client, entry, source, detector, prepared, times, started, scratch):
+        pipeline, inner, recorder = client
         page, shard = entry.page, entry.shard
         recorder.page = {k: page[k] for k in ("doc_id", "page_id", "eval_partition") if k in page}
         recorder.page.update(split=page.get("split", "mine"), page_image=str(entry.image))
@@ -492,6 +506,7 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
             context = checkpoint(entry, detector, times)
         else:
             context = prepared_layout(inner, source, prepared)
+            predict["use_layout_detection"] = True
             predict["use_queues"] = False
 
         received_page = False
@@ -514,44 +529,56 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
             if progress:
                 progress(f"整页断点已保存 · {page['doc_id']} 第 {page['page_id']} 页 · {len(recorder.rows)} 个区域 · "
                          f"单页 {seconds:.1f} 秒 · vLLM 请求 {request_seconds:.1f} 秒")
-        elif progress:
-            progress(f"区域服务错误 · {entry.image} · 下次重试 OCR")
+        else:
+            # Include failures in this run's manifest without marking the page resumable.
+            shard = scratch / shard.name
+            write_rows(shard, recorder.rows)
+            update(entry, "区域服务错误")
+            if progress:
+                progress(f"区域服务错误 · {entry.image} · 下次重试 OCR")
         if report_work:
             report_work("paddle", page["doc_id"], failed=failed)
-        return recorder.rows
-
-    pipeline = inner = detector = None
+        return shard
 
     def rows():
-        nonlocal pipeline, inner, detector, mode
+        nonlocal mode
         page_counts = Counter(entry.page["doc_id"] for entry in plan)
         file_numbers = {doc_id: index for index, doc_id in enumerate(page_counts, 1)}
-        pending = None
+        main_client = None
+        pending = {}
+        free_clients = []
+        shards = []
         predict = options.get("predict", {})
+
+        def collect(finished):
+            for future in finished:
+                index, client = pending.pop(future)
+                shards[index] = future.result()
+                free_clients.append(client)
+
         with ExitStack() as stack:
+            scratch = Path(stack.enter_context(TemporaryDirectory(dir=root, prefix=".capture-")))
+            resources = stack.enter_context(ExitStack())
             entries = stack.enter_context(rendered_entries(config, manifest, root, plan, progress, check_cancelled, report_work))
             for index, entry in enumerate(entries):
                 if check_cancelled:
                     check_cancelled()
+                collect([future for future in pending if future.done()])
+                shards.append(entry.shard)
                 if entry.cached:
-                    if pending is not None:
-                        yield from pending.result()
-                        pending = None
                     if not plan[index].cached:
                         update(entry, "复用整页")
                         if report_work:
                             report_work("paddle", entry.page["doc_id"])
-                    yield from read_rows(entry.shard)
                     continue
-                if pipeline is None:
-                    url = stack.enter_context(recorder.listen())
+                if main_client is None:
                     if progress:
                         progress("初始化 PaddleOCR 版面识别")
                     observe = report_device and predict.get("use_layout_detection", True)
                     with (predictor_devices() if observe else nullcontext()) as devices:
-                        pipeline = create_pipeline(url)
+                        main_client = create_client(resources)
+                    pipeline, inner, _ = main_client
                     px = getattr(pipeline, "paddlex_pipeline", None)
-                    inner = getattr(px, "_pipeline", px)
                     detector = getattr(inner, "layout_det_model", None)
                     if observe:
                         runner = getattr(detector, "runner", None)
@@ -563,8 +590,12 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                             and not getattr(inner, "use_doc_preprocessor", False)
                             and not predict.get("use_doc_orientation_classify") and not predict.get("use_doc_unwarping"))
                     if fast:
-                        mode = "双页流水线"
-                        worker = stack.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix="paddle-ocr"))
+                        page_window = min(target.get("page_window", 4), target.get("concurrency", 4))
+                        if getattr(inner, "vl_rec_model", None) is None:
+                            page_window = 1
+                        mode = f"跨页 OCR 队列 · 最多 {page_window} 页" if page_window > 1 else "双页流水线"
+                        worker = stack.enter_context(ThreadPoolExecutor(max_workers=page_window, thread_name_prefix="paddle-ocr"))
+                        free_clients.append(main_client)
                     if progress:
                         progress(f"Paddle · {mode}")
                 page = entry.page
@@ -575,7 +606,7 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                 started = monotonic()
                 times = {}
                 if not fast:
-                    yield from recognize(entry, str(entry.image), detector, None, times, started)
+                    shards[index] = recognize(main_client, entry, str(entry.image), detector, None, times, started, scratch)
                     continue
                 update(entry, "准备版面")
                 image, = inner.img_reader([str(entry.image)])
@@ -589,11 +620,18 @@ def capture_pages(config, manifest, root, progress=None, report_device=None, pla
                                            filter_overlap_boxes=False))
                 if len(layout) != 1:
                     raise RuntimeError(f"版面检测未返回单页结果 · {entry.image}")
-                if pending is not None:
-                    yield from pending.result()
-                pending = worker.submit(recognize, entry, image, detector, layout, times, started)
-            if pending is not None:
-                yield from pending.result()
+                if len(pending) == page_window:
+                    collect(wait(pending, return_when=FIRST_COMPLETED).done)
+                else:
+                    collect([future for future in pending if future.done()])
+                client = free_clients.pop() if free_clients else create_client(resources, recognition_only=True)
+                future = worker.submit(recognize, client, entry, image, detector, layout, times, started, scratch)
+                pending[future] = index, client
+            collect(list(pending))
+            for shard in shards:
+                if check_cancelled:
+                    check_cancelled()
+                yield from read_rows(shard)
 
     output = root / "regions.jsonl"
     write_rows(output, rows())

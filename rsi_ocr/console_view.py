@@ -316,6 +316,8 @@ def console_view(snap, selected, message, expanded, width, height, now, frame, m
     if capture and not paddle_finished and remaining >= 5 and not expanded:
         total, reused, done = capture["total"], capture["reused"], capture["done"]
         detail = f"Paddle · 复用 {reused} 页 · 新完成 {done} 页 · 剩余 {total - reused - done} 页"
+        if capture.get("ocr_pages"):
+            detail += f" · OCR 处理中 {capture['ocr_pages']} 页"
         if capture.get("layout_page") and capture.get("ocr_page"):
             detail += f" · 版面 {capture['layout_page']} · OCR {capture['ocr_page']}"
         elif capture.get("current"):

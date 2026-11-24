@@ -1,20 +1,25 @@
 """Serve the local OCR review workbench."""
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import difflib
 import json
+import os
 import re
 import sqlite3
+from threading import Lock
+from time import monotonic
 from typing import Literal
 from uuid import uuid4
-from contextlib import closing
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from io import BytesIO
+from itertools import islice
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -22,7 +27,7 @@ from pydantic import BaseModel, Field
 from rsi_ocr.benchmark import reference_comparison, reference_metrics, region_key, selection_summary
 from rsi_ocr.mining import FIXED_RULES, choose_transcription, classify, select, selected_result
 from rsi_ocr.formats import table_cells, table_metrics
-from rsi_ocr.store import digest, json_text, read_rows, write_rows
+from rsi_ocr.store import digest, json_text, write_rows
 from rsi_ocr.training import paddle_sft_record
 
 ASSETS = Path(__file__).with_name("review_ui")
@@ -163,42 +168,118 @@ def import_cover(run):
     return first.get("doc_id"), cover
 
 
-def read_batch(run, evaluation, title):
+def file_version(stat):
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def import_version(run):
+    inputs = run.parent / "input"
+    version = []
+    paths = [run / name for name in BATCH_FILES]
+    for path in paths + [inputs / "pages.jsonl", inputs / "references.jsonl"]:
+        try:
+            version.append(file_version(path.stat()))
+        except FileNotFoundError:
+            version.append(None)
+    return tuple(version)
+
+
+def batch_lines(path, stage, report):
+    with path.open("rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        offset = 0
+        next_update = 0
+        for line in stream:
+            if report and monotonic() >= next_update:
+                report(stage, offset, size)
+                next_update = monotonic() + 0.25
+            start = offset
+            offset += len(line)
+            if start == 0:
+                line = line.removeprefix(b"\xef\xbb\xbf")
+            if line.strip():
+                yield start, line
+        if report:
+            report(stage, offset, size)
+
+
+@contextmanager
+def evidence_stream(batch):
+    try:
+        stream = (batch["path"] / "evidence.jsonl").open("rb")
+    except OSError as error:
+        raise HTTPException(409, "无法读取批次的 evidence.jsonl，请检查目录并重新导入") from error
+    with stream:
+        if file_version(os.fstat(stream.fileno())) != batch["evidence_version"]:
+            raise HTTPException(409, "识别结果已更新，请重新导入该批次")
+        yield stream
+
+
+def evidence_row(stream, entry):
+    stream.seek(entry["_offset"])
+    row = json.loads(stream.readline())
+    if row["case_id"] != entry["case_id"]:
+        raise HTTPException(409, "识别结果已更新，请重新导入该批次")
+    for key in ("selection", "reasons", "priority", "hard_case", "target_operational_error"):
+        if key in entry:
+            row[key] = entry[key]
+    return row
+
+
+def read_batch(run, evaluation, title, report=None):
     pages = run.parent / "input" / "pages.jsonl"
-    sources = Counter(row["doc_id"] for row in read_rows(pages)) if pages.is_file() else {}
+    sources = Counter()
+    if pages.is_file():
+        sources.update(json.loads(line)["doc_id"] for _, line in batch_lines(pages, "读取页清单", report))
     summary = document(run / "summary.json")
+    evidence = run / "evidence.jsonl"
+    batch = {"title": title, "path": run.resolve(), "evidence_version": file_version(evidence.stat()),
+             "summary": summary, "sources": sources}
     rows = {}
-    for row in read_rows(run / "evidence.jsonl"):
-        if "selection" not in row:
-            row["selection"] = choose_transcription(row["models"], row["target_alias"], summary["mining"])
-        rows[row["case_id"]] = row
+    for offset, line in batch_lines(evidence, "索引识别区域", report):
+        row = json.loads(line)
+        target = row["models"][row["target_alias"]]
+        entry = {key: row[key] for key in ("case_id", "doc_id", "page_id", "region_id", "task", "image", "page_image",
+                 "image_sha256", "split", "priority", "reasons", "audit_sample", "hard_case", "signals",
+                 "target_operational_error", "selection") if key in row}
+        if "selection" not in entry:
+            entry["selection"] = choose_transcription(row["models"], row["target_alias"], summary["mining"])
+        entry["_offset"] = offset
+        entry["valid_target"] = bool(target.get("label"))
+        judge = target.get("judge", {})
+        entry["target_state"] = {"status": target.get("status"),
+                                 "judge": {key: judge.get(key) for key in ("status", "prob_yes")}}
+        rows[row["case_id"]] = entry
+    queue = {json.loads(line)["case_id"] for _, line in batch_lines(run / "review.jsonl", "读取复核队列", report)}
     details = {}
     references_path = pages.with_name("references.jsonl")
-    if evaluation:
-        details = {item["case_id"]: item for item in read_rows(evaluation / "cases.jsonl") if item["case_id"] in rows}
-    elif references_path.is_file():
-        by_region = {region_key(row): row for row in rows.values()}
-        with references_path.open(encoding="utf-8-sig") as stream:
-            for line in stream:
-                try:
-                    ref = json.loads(line)
-                    row = by_region.get(region_key(ref))
-                    reference = ref["reference"]
-                    if not row or ref.get("image_sha256") != row["image_sha256"] or not isinstance(reference, str) or not reference.strip():
+    if evaluation or references_path.is_file():
+        with evidence_stream(batch) as stream:
+            if evaluation:
+                for _, line in batch_lines(evaluation / "cases.jsonl", "读取评测结果", report):
+                    item = json.loads(line)
+                    if item["case_id"] in rows:
+                        row = evidence_row(stream, rows[item["case_id"]])
+                        item["selection_gt"] = reference_comparison(row, item["models"])
+                        details[item["case_id"]] = item
+            else:
+                by_region = {region_key(row): row for row in rows.values()}
+                for _, line in batch_lines(references_path, "核对 GT", report):
+                    try:
+                        ref = json.loads(line)
+                        entry = by_region.get(region_key(ref))
+                        reference = ref["reference"]
+                        if not entry or ref.get("image_sha256") != entry["image_sha256"] or not isinstance(reference, str) or not reference.strip():
+                            continue
+                        row = evidence_row(stream, entry)
+                        metrics = reference_metrics(row, reference)
+                        details[row["case_id"]] = {"reference": reference, "models": metrics,
+                                                   "selection_gt": reference_comparison(row, metrics)}
+                    except (KeyError, TypeError, ValueError):
                         continue
-                    details[row["case_id"]] = {"reference": reference, "models": reference_metrics(row, reference)}
-                except (KeyError, TypeError, ValueError):
-                    continue
-    for case_id, detail in details.items():
-        detail["selection_gt"] = reference_comparison(rows[case_id], detail["models"])
-    return {
-        "sources": sources,
-        "title": title, "path": run.resolve(),
-        "summary": summary, "rows": rows,
-        "queue": {row["case_id"] for row in read_rows(run / "review.jsonl")},
-        "details": details, "selection_gt": selection_summary([item["selection_gt"] for item in details.values()]),
-        "report": document(evaluation / "report.json") if evaluation else None,
-    }
+    return {**batch, "rows": rows, "queue": queue,
+            "details": details, "selection_gt": selection_summary([item["selection_gt"] for item in details.values()]),
+            "report": document(evaluation / "report.json") if evaluation else None}
 
 
 def table_view(label, baseline):
@@ -260,7 +341,7 @@ def project_batch(batch, thresholds):
     policy = {**batch["summary"]["mining"], **thresholds}
     rows = {}
     for key, row in batch["rows"].items():
-        result = classify(row["models"][row["target_alias"]], row["signals"], policy)
+        result = classify(row["target_state"], row["signals"], policy)
         rows[key] = {**row, **result}
     queue = {row["case_id"] for row in select(rows.values(), policy)}
     summary = {**batch["summary"], "mining": policy, "review": len(queue),
@@ -288,7 +369,18 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         batches["benchmark"] = read_batch(run, evaluation, title)
     if production:
         batches["production"] = read_batch(production, None, "Paddle 原页采集")
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    imports = {}
+    import_lock = Lock()
+    readers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="studio-import")
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            readers.shutdown(wait=True, cancel_futures=True)
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     if host not in {"0.0.0.0", "::"}:
         authority = f"[{host}]" if ":" in host else host
         allowed = re.compile(rf"(?:127\.0\.0\.1|localhost|{re.escape(authority)})(?::[0-9]+)?", re.IGNORECASE)
@@ -382,21 +474,28 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         batch = get_batch(batch_id)
         if case_id not in batch["rows"]:
             raise HTTPException(404, "样本不存在")
-        return batch, batch["rows"][case_id]
+        with evidence_stream(batch) as stream:
+            return batch, evidence_row(stream, batch["rows"][case_id])
 
     @app.get("/")
     def index():
         return FileResponse(ASSETS / "index.html", headers={"Cache-Control": "no-cache"})
+
+    def library_run(name):
+        if not library or not name or name in {".", ".."} or Path(name).name != name:
+            return None
+        path = library / name / "production"
+        if path.resolve().is_relative_to(library.resolve()) and all((path / file).is_file() for file in BATCH_FILES):
+            return path
+        return None
 
     def available_runs():
         if not library or not library.is_dir():
             return {}
         result = {}
         for path in sorted(library.iterdir(), reverse=True):
-            run_path = path / "production"
-            if run_path.resolve().is_relative_to(library.resolve()) and all(
-                (run_path / name).is_file() for name in BATCH_FILES
-            ):
+            run_path = library_run(path.name)
+            if run_path:
                 result[path.name] = run_path
         return result
 
@@ -417,7 +516,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
 
     @app.get("/api/imports/{name}/cover")
     def batch_cover(name: str):
-        run = available_runs().get(name)
+        run = library_run(name)
         if run:
             try:
                 _, cover = import_cover(run)
@@ -428,20 +527,54 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                 pass
         raise HTTPException(404, "批次没有可用的首页预览")
 
-    def open_import(path, name):
+    def read_import(key, path, name, version):
+        def progress(stage, done, total):
+            with import_lock:
+                imports[key]["progress"] = {"state": "reading", "stage": stage, "done": done, "total": total}
+
+        try:
+            batch = read_batch(path, None, name, progress)
+            if import_version(path) != version:
+                raise ValueError("结果文件在读取期间已更新，请重新导入")
+        except Exception as error:
+            with import_lock:
+                imports[key]["progress"] = {"state": "error", "detail": f"批次读取失败：{error}"}
+            return
+        with import_lock:
+            batches[key] = batch
+            imports[key]["progress"] = {"state": "ready"}
+
+    def open_import(path, name, background):
         path = path.resolve()
         identity = str(path)
         if library and path == library.resolve() / name / "production":
             identity = name  # Keep existing library batch IDs and their browser undo history.
         key = "import-" + digest(identity.encode())[:20]
-        try:
-            batches[key] = read_batch(path, None, name)
-        except (ValueError, KeyError, TypeError, OSError) as error:
-            raise HTTPException(422, f"批次读取失败：{error}") from error
+        version = import_version(path)
+        with import_lock:
+            job = imports.get(key)
+            if job is None or job["progress"]["state"] == "error" or (
+                job["progress"]["state"] == "ready" and job["version"] != version
+            ):
+                job = {"version": version, "progress": {"state": "queued", "stage": "等待读取"}}
+                imports[key] = job
+                job["future"] = readers.submit(read_import, key, path, name, version)
+            if background:
+                return {"id": key, "name": name, **job["progress"]}
+        job["future"].result()
+        if job["progress"]["state"] == "error":
+            raise HTTPException(422, job["progress"]["detail"])
         return {"id": key, "name": name}
 
+    @app.get("/api/import-progress/{key}")
+    def import_progress(key: str):
+        with import_lock:
+            if key not in imports:
+                raise HTTPException(404, "导入任务不存在，请重新导入")
+            return imports[key]["progress"]
+
     @app.post("/api/imports")
-    def import_by_path(source: ImportPath):
+    def import_by_path(source: ImportPath, background: bool = False):
         raw = source.path.strip()
         if not raw or "\x00" in raw:
             raise HTTPException(422, "请输入服务器上的结果目录路径")
@@ -455,51 +588,64 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
             raise HTTPException(422, f"无法打开目录：{error}") from error
         if missing:
             raise HTTPException(422, f"请指定已完成的批次或 production 目录。{path} 缺少 {', '.join(missing)}")
-        return open_import(path, path.parent.name if path.name == "production" else path.name)
+        return open_import(path, path.parent.name if path.name == "production" else path.name, background)
 
     @app.post("/api/imports/{name}")
-    def import_batch(name: str):
-        path = available_runs().get(name)
+    def import_batch(name: str, background: bool = False):
+        path = library_run(name)
         if path is None:
             raise HTTPException(404, "批次不存在或仍在生成")
-        return open_import(path, name)
+        return open_import(path, name, background)
 
     @app.get("/api/batches")
     def batch_list():
-        return {key: batch["title"] for key, batch in batches.items()}
+        with import_lock:
+            return {key: batch["title"] for key, batch in batches.items()}
 
-    @app.get("/api/batches/{batch_id}")
-    def batch_data(batch_id: str):
-        batch = get_batch(batch_id)
-        recorded = decisions(batch["path"] / "review.sqlite")
-        rows = []
+    def queue_entries(batch, recorded):
         for case_id, row in batch["rows"].items():
-            target = row["models"][row["target_alias"]]
+            target = row["target_state"]
             detail = batch["details"].get(case_id, {})
             comparison = detail.get("selection_gt", {})
-            rows.append({
+            yield {
                 **{key: row.get(key) for key in
                    ("case_id", "doc_id", "page_id", "region_id", "task", "priority", "reasons", "audit_sample", "hard_case")},
                 "operational": bool(row.get("target_operational_error")),
-                "valid_target": bool(target.get("label")),
+                "valid_target": row["valid_target"],
                 "selection_status": row["selection"]["status"],
                 "queued": case_id in batch["queue"], "judge_status": target.get("judge", {}).get("status"),
-                "review_status": recorded.get(case_id, {}).get("status", "pending"),
+                "review_status": recorded.get(case_id, "pending"),
                 "target_error": detail.get("target_error"), "repairable": detail.get("repairable"),
                 "gt_closest": comparison.get("is_closest") if comparison.get("valid_candidates", 0) >= 2 else None,
                 "exportable": row.get("split", "mine") in SFT_SPLITS,
                 "split": row.get("split", "mine"),
-            })
-        return {"rows": rows, "summary": batch["summary"], "report": batch["report"], "sources": batch["sources"],
-                "selection_gt": batch["selection_gt"],
-                "original_thresholds": threshold_values(original_batch(batch_id)["summary"]["mining"])}
+            }
+
+    @app.get("/api/batches/{batch_id}")
+    def batch_data(batch_id: str, stream: bool = False):
+        original = original_batch(batch_id)
+        with closing(decision_db(original["path"] / "review.sqlite")) as db:
+            batch = active_policy(original, db)
+            recorded = dict(db.execute("SELECT case_id, json_extract(payload, '$.status') FROM decisions"))
+        metadata = {"summary": batch["summary"], "report": batch["report"], "sources": batch["sources"],
+                    "selection_gt": batch["selection_gt"], "original_thresholds": threshold_values(original["summary"]["mining"])}
+        rows = queue_entries(batch, recorded)
+        if not stream:
+            return JSONResponse({**metadata, "rows": list(rows)})
+
+        def chunks():
+            yield json.dumps({**metadata, "total": len(batch["rows"])}, ensure_ascii=False) + "\n"
+            while group := list(islice(rows, 256)):
+                yield json.dumps(group, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+        return StreamingResponse(chunks(), media_type="application/x-ndjson", headers={"X-Accel-Buffering": "no"})
 
     @app.post("/api/batches/{batch_id}/bulk")
     def bulk_pass(batch_id: str, ids: list[str]):
         batch = original_batch(batch_id)
         token = uuid4().hex
         changed = []
-        with closing(decision_db(batch["path"] / "review.sqlite")) as db, db:
+        with evidence_stream(batch) as stream, closing(decision_db(batch["path"] / "review.sqlite")) as db, db:
             db.execute("BEGIN IMMEDIATE")
             batch = active_policy(batch, db)
             for key in dict.fromkeys(ids):
@@ -511,7 +657,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
                 if row["selection"]["status"] != "selected":
                     continue
                 try:
-                    record = decision_record(row, "approved", row["selection"]["model_alias"])
+                    record = decision_record(evidence_row(stream, row), "approved", row["selection"]["model_alias"])
                 except (ValueError, OSError) as error:
                     raise HTTPException(422, str(error)) from error
                 record.update(source="bulk_approved", bulk_id=token)
@@ -553,6 +699,7 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
         has_page = bool(row.get("page_image") and Path(row["page_image"]).is_file())
         database = batch["path"] / "review.sqlite"
         with closing(decision_db(database)) as db:
+            decision = db.execute("SELECT payload FROM decisions WHERE case_id = ?", (case_id,)).fetchone()
             saved_location = db.execute("SELECT payload FROM review_locations WHERE case_id = ?", (case_id,)).fetchone()
         manual_box = json.loads(saved_location[0])["box"] if saved_location else None
         return {
@@ -562,13 +709,13 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
             "has_crop": Path(row["image"]).is_file(),
             "page_geometry": page_geometry(row, manual_box) if has_page else None,
             "export_split": SFT_SPLITS.get(row.get("split", "mine")),
-            "decision": decisions(batch["path"] / "review.sqlite").get(case_id),
+            "decision": json.loads(decision[0]) if decision else None,
             "policy": batch["summary"]["mining"],
         }
 
     @app.get("/api/batches/{batch_id}/cases/{case_id}/image/{kind}")
     def case_image(batch_id: str, case_id: str, kind: str):
-        _, row = get_case(batch_id, case_id)
+        row = original_batch(batch_id)["rows"].get(case_id, {})
         field = {"crop": "image", "page": "page_image"}.get(kind)
         if not field or not row.get(field) or not Path(row[field]).is_file():
             raise HTTPException(404, "原图不可用")
@@ -602,7 +749,12 @@ def create_app(run=None, evaluation=None, production=None, library=None, manager
     @app.get("/api/batches/{batch_id}/export/selected")
     def export_selected(batch_id: str):
         batch = original_batch(batch_id)
-        return StreamingResponse((json_text(selected_result(row)) + "\n" for row in batch["rows"].values()),
+        def records():
+            with evidence_stream(batch) as stream:
+                for entry in batch["rows"].values():
+                    yield json_text(selected_result(evidence_row(stream, entry))) + "\n"
+
+        return StreamingResponse(records(),
                                  media_type="application/x-ndjson",
                                  headers={"Content-Disposition": 'attachment; filename="selected.jsonl"'})
 

@@ -41,7 +41,7 @@ deployment:
     # 双卡例：gpu: "2,3", tensor_parallel: 2, gpu_memory: 0.80。
     # path 相对于 model_root，也可填写绝对路径。context 为最大上下文 token 数。
     layout: {path: PP-DocLayoutV3, device: cpu}  # 版面检测设备，例如 gpu:0
-    paddle: {enabled: true, path: paddleocr-vl-16, gpu: "0", port: 8100, context: 12288}  # 必须启用
+    paddle: {enabled: true, path: paddleocr-vl-16, gpu: "0", port: 8100, context: 12288, page_window: 4}  # 多页共享并发上限
     oxr:    {enabled: true, path: OXR-1.0, gpu: "0", port: 8080, context: 16384}
     ovis:   {enabled: true, path: OvisOCR3, gpu: "0", port: 8102, context: 16384}
     jev:    {enabled: true, path: MiniCPM-OCR-Jev, gpu: "0", port: 18499, render_port: 18500, context: 16384}

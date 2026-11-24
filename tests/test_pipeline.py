@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from threading import Event
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -113,6 +114,58 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((path.parent / row["image"]).read_bytes(), PNG)
         self.assertEqual(row["target"]["raw"], "raw OCR")
         self.assertEqual(row["target"]["parameters"], {"max_tokens": 200})
+
+    def test_cross_page_queue_reuses_free_client_while_first_page_is_busy(self):
+        self.config["models"]["paddle"].update(page_window=2, concurrency=2)
+        manifest = self.root / "pages.jsonl"
+        for n in (1, 2, 3):
+            (self.root / f"{n}.png").write_bytes(PNG)
+        write_rows(manifest, ({"doc_id": "scan", "page_id": n, "image": f"{n}.png"} for n in (1, 2, 3)))
+        clients = {}
+        detectors = []
+        third_saved = Event()
+
+        @contextmanager
+        def listen(recorder):
+            url = f"local-{len(clients)}"
+            clients[url] = recorder
+            yield url
+
+        def pipeline(**options):
+            recorder = clients[options["vl_rec_server_url"]]
+            inner = SimpleNamespace(vl_rec_model=object(), img_reader=lambda paths: [int(Path(paths[0]).stem)])
+            if options.get("use_layout_detection", True):
+                detectors.append(inner)
+                inner.layout_det_model = lambda images, **kwargs: [{"boxes": [], "page": images[0]}]
+
+            def predict(image, **kwargs):
+                result, = inner.layout_det_model([image])
+                self.assertEqual(result["page"], image)
+                payload = {"model": "paddle", "max_tokens": image, "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "OCR:"}, {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64," + base64.b64encode(PNG).decode()}}]}]}
+                self.assertEqual(recorder.forward("/chat/completions", payload)[0], 200)
+                yield {"layout_det_res": result}
+
+            return SimpleNamespace(paddlex_pipeline=inner, predict_iter=predict)
+
+        def reply(resource, payload):
+            if payload["max_tokens"] == 1:
+                self.assertTrue(third_saved.wait(5), "page 3 should finish while page 1 is in flight")
+            return chat(f"raw {payload['max_tokens']}")
+
+        def progress(message):
+            if message.startswith("整页断点已保存 · scan 第 3 页"):
+                third_saved.set()
+
+        with (patch.dict("sys.modules", {"paddleocr": SimpleNamespace(PaddleOCRVL=pipeline)}),
+              patch.object(Recorder, "listen", listen), patch.object(Service, "request", side_effect=reply)):
+            result = capture_pages(self.config, manifest, self.root / "capture", progress=progress)
+        self.assertEqual(len(detectors), 1)
+        self.assertEqual(len(clients), 2)
+        self.assertIs(clients["local-0"].service, clients["local-1"].service)
+        self.assertEqual([(row["page_id"], row["region_id"], row["target"]["raw"]) for row in read_rows(result)],
+                         [(n, "0", f"raw {n}") for n in (1, 2, 3)])
 
     def test_restart_after_layout_then_reuse_completed_batch(self):
         from rsi_ocr.local import run_local

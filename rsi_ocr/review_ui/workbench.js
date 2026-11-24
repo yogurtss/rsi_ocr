@@ -79,21 +79,30 @@ function notice(message, error = false) {
   if (message && !error) notice.timer = setTimeout(() => { element.hidden = true; }, 3200);
 }
 
-async function api(path, options) {
+async function requestApi(path, options) {
   const response = await fetch(path, {cache: "no-store", ...options});
   if (!response.ok) {
     const result = await response.json().catch(() => null);
     throw new Error(typeof result?.detail === "string" ? result.detail : `请求失败（HTTP ${response.status}）`);
   }
-  return response.json();
+  return response;
+}
+
+async function api(path, options) {
+  return (await requestApi(path, options)).json();
 }
 
 const batchPath = () => "/api/batches/" + encodeURIComponent(state.batch);
 const casePath = () => batchPath() + "/cases/" + encodeURIComponent(state.current);
 
+const queuePageSize = 100;
+let queuePage = 0;
 function renderQueue() {
   const list = q("#queue-list");
-  list.innerHTML = state.rows.map(row => {
+  const pages = Math.ceil(state.rows.length / queuePageSize);
+  queuePage = Math.max(0, Math.min(queuePage, pages - 1));
+  const start = queuePage * queuePageSize;
+  list.innerHTML = state.rows.slice(start, start + queuePageSize).map(row => {
     const selected = state.current === row.case_id;
     const title = row.doc_id.split("/").pop();
     const status = row.review_status !== "pending" ? statuses[row.review_status] :
@@ -105,6 +114,18 @@ function renderQueue() {
     </button>`;
   }).join("") || '<p class="empty">没有符合条件的样本。</p>';
   q("#queue-count").textContent = state.rows.length + " 条";
+  q("#queue-pages").hidden = pages < 2;
+  q("#queue-pages span").textContent = `${queuePage + 1} / ${pages}`;
+  q("#queue-prev-page").disabled = queuePage === 0;
+  q("#queue-next-page").disabled = queuePage + 1 >= pages;
+}
+
+for (const [id, step] of [["queue-prev-page", -1], ["queue-next-page", 1]]) {
+  q("#" + id).onclick = () => {
+    queuePage += step;
+    renderQueue();
+    q("#queue-list").scrollTop = 0;
+  };
 }
 
 const difficultyLabels = {all: "全部", hard: "难例", easy: "非难例", error: "异常"};
@@ -131,7 +152,7 @@ function filterQueue() {
     && (gold === "all" || (gold === "miss" && row.gt_closest === false) || (gold === "hit" && row.gt_closest === true)
       || (gold === "error" && row.target_error) || (gold === "repairable" && row.repairable))
     && (!query || [row.doc_id, row.region_id, row.case_id].join(" ").toLowerCase().includes(query))
-  )).sort((a, b) => (b.priority ?? -1) - (a.priority ?? -1) || a.case_id.localeCompare(b.case_id));
+  ));
   q("#difficulty").innerHTML = Object.entries(difficultyLabels).map(([key,label]) =>
     `<button data-level="${key}" aria-pressed="${state.level === key}">${label} ${state.data.rows.filter(r => key === "all" || difficultyOf(r) === key).length}</button>`).join("");
   q("#bulk").hidden = state.level !== "easy";
@@ -139,11 +160,13 @@ function filterQueue() {
   q("#bulk").textContent = `一键通过 ${count} 条 · 采用择优结果`;
   q("#bulk").disabled = !count || state.saving;
   q("#undo").hidden = !sessionStorage.getItem("undo-" + state.batch);
-  renderQueue();
-  if (!state.rows.some(row => row.case_id === state.current)) {
+  const index = state.rows.findIndex(row => row.case_id === state.current);
+  if (index < 0) {
     selectCase(state.rows[0]?.case_id);
-  } else if (state.case) {
-    updateNavigation();
+  } else {
+    queuePage = Math.floor(index / queuePageSize);
+    renderQueue();
+    if (state.case) updateNavigation();
   }
 }
 
@@ -159,21 +182,62 @@ function clearFilters() {
   for (const id of ["scope", "status", "reason", "judge", "gold"]) q("#" + id).value = "all";
 }
 
+function sortQueue(rows) {
+  rows.sort((a, b) => (b.priority ?? -1) - (a.priority ?? -1) || a.case_id.localeCompare(b.case_id));
+}
+
+async function readQueue(path, panel, signal) {
+  const response = await requestApi(path + "?stream=true", {signal});
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "", data;
+  const rows = [];
+  try {
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      const lines = (pending + decoder.decode(value, {stream:true})).split("\n");
+      pending = lines.pop();
+      for (const line of lines) {
+        if (!data) data = JSON.parse(line);
+        else rows.push(...JSON.parse(line));
+      }
+      if (data) {
+        const bar = panel.querySelector("progress");
+        bar.max = Math.max(data.total, 1);
+        bar.value = rows.length;
+        panel.querySelector("span").textContent = `正在加载样本目录 · ${rows.length} / ${data.total} 个区域`;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (!data || pending || rows.length !== data.total) throw new Error("样本目录传输不完整，请重新加载批次");
+  sortQueue(rows);
+  return {...data, rows};
+}
+
+let queueRequest;
 async function loadBatch(batch) {
   const request = ++state.request;
+  queueRequest?.abort();
+  const controller = new AbortController();
+  queueRequest = controller;
   state.loading = true;
   state.batch = batch;
   state.current = null;
   state.case = null;
   state.data = null;
+  state.rows = [];
   q("#export-menu").hidden = true;
   if (!q("#settings").hidden) initSettings();
   q("#queue-list").replaceChildren();
+  q("#queue-pages").hidden = true;
   q("#queue-count").textContent = "";
-  q("#inspection").innerHTML = '<p class="empty">正在读取批次…</p>';
+  q("#inspection").innerHTML = '<div class="empty import-progress"><span>正在加载样本目录…</span><progress aria-label="加载样本目录"></progress></div>';
   q("#overview").replaceChildren();
   try {
-    const data = await api(batchPath());
+    const data = await readQueue(batchPath(), q("#inspection .import-progress"), controller.signal);
     if (request !== state.request) return;
     state.data = data;
     state.loading = false;
@@ -197,6 +261,9 @@ async function loadBatch(batch) {
     state.loading = false;
     q("#inspection").innerHTML = '<p class="empty">无法读取批次。</p>';
     notice(error.message, true);
+  } finally {
+    controller.abort();
+    if (queueRequest === controller) queueRequest = null;
   }
 }
 
@@ -214,6 +281,8 @@ async function selectCase(id, {reveal = false} = {}) {
   state.case = null;
   state.compare = null;
   state.difference = true;
+  const index = state.rows.findIndex(row => row.case_id === id);
+  queuePage = index < 0 ? 0 : Math.floor(index / queuePageSize);
   renderQueue();
   const inspector = q("#inspection");
   inspector.innerHTML = id ? '<p class="empty">正在加载样本…</p>' : '<p class="empty">请调整筛选条件以查看样本。</p>';
@@ -811,6 +880,7 @@ locationContent.addEventListener("pointerup", async event => {
 });
 
 function renderOverview() {
+  if (q("#overview").hidden || !state.data) return;
   const {summary, report, rows} = state.data;
   const reviewed = rows.filter(row => ["approved", "rejected"].includes(row.review_status)).length;
   const sources = Object.entries(state.data.sources || {});
@@ -867,6 +937,7 @@ function view(page) {
   q("#view-settings").setAttribute("aria-pressed",page === "settings");
   if (page === "settings") initSettings();
   q("#overview").hidden = page !== "overview";
+  if (page === "overview") renderOverview();
   q("#view-review").setAttribute("aria-pressed", page === "review");
   q("#view-overview").setAttribute("aria-pressed", page === "overview");
 }
@@ -1070,6 +1141,20 @@ q("#import-path-form").onsubmit = event => {
   }
 };
 
+function showImportProgress(panel, status) {
+  const bar = panel.querySelector("progress");
+  let label = status.stage || "正在打开批次";
+  if (status.total > 0) {
+    bar.max = status.total;
+    bar.value = status.done;
+    label += ` · ${Math.floor(status.done * 100 / status.total)}%（${(status.done / 1048576).toFixed(1)} / ${(status.total / 1048576).toFixed(1)} MiB）`;
+  } else {
+    bar.removeAttribute("value");
+  }
+  panel.querySelector("span").textContent = label;
+  panel.hidden = false;
+}
+
 async function openImport(value, trigger) {
   if (importing || state.saving) return;
   importing = value;
@@ -1081,9 +1166,20 @@ async function openImport(value, trigger) {
   q("#import-list").querySelectorAll("button").forEach(button => { button.disabled = true; });
   if (trigger) trigger.querySelector(".batch-action b").textContent = "正在导入…";
   let errorMessage = "";
+  const panel = q(trigger ? "#card-progress" : "#path-progress");
+  showImportProgress(panel, {});
+  if (trigger) panel.scrollIntoView({block:"nearest"});
   try {
-    const batch = trigger ? await api("/api/imports/" + encodeURIComponent(value), {method:"POST"}) :
-      await api("/api/imports", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({path:value})});
+    const batch = trigger ? await api("/api/imports/" + encodeURIComponent(value) + "?background=true", {method:"POST"}) :
+      await api("/api/imports?background=true", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({path:value})});
+    let status = batch;
+    while (status.state && status.state !== "ready") {
+      if (!trigger && !importDialog.open) return;
+      if (status.state === "error") throw new Error(status.detail);
+      showImportProgress(panel, status);
+      await new Promise(resolve => setTimeout(resolve, 400));
+      status = await api("/api/import-progress/" + encodeURIComponent(batch.id));
+    }
     if (!trigger && !importDialog.open) return;
     const select = q("#batch");
     if (![...select.options].some(option => option.value === batch.id)) select.add(new Option(batchLabel(batch.name), batch.id));
@@ -1094,6 +1190,7 @@ async function openImport(value, trigger) {
   } catch (error) {
     errorMessage = "导入失败 · " + error.message;
   } finally {
+    panel.hidden = true;
     importing = "";
     q("#import-load").disabled = importPath.readOnly = false;
     q("#import-load").textContent = "加载";
@@ -1133,6 +1230,7 @@ async function bulkReview(undo) {
     if (undo) sessionStorage.removeItem(key);
     else if (result.changed.length) sessionStorage.setItem(key, result.bulk_id);
     const fresh = await api(batchPath());
+    sortQueue(fresh.rows);
     state.data = fresh;
     const current = state.current;
     state.case = null;
