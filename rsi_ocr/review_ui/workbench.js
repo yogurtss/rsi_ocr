@@ -323,7 +323,9 @@ async function selectCase(id, {reveal = false} = {}) {
       if (itemBox.top < queueBox.top) list.scrollTop += itemBox.top - queueBox.top - 4;
       if (itemBox.bottom > queueBox.bottom) list.scrollTop += itemBox.bottom - queueBox.bottom + 4;
     }
-    if (reveal) inspector.scrollIntoView({block: "start"});
+    if (reveal && !matchMedia("(min-width: 821px) and (min-height: 520px)").matches) {
+      inspector.scrollIntoView({block: "start"});
+    }
   } catch (error) {
     if (request !== state.request) return;
     inspector.innerHTML = '<p class="empty">无法加载样本。请从队列重新选择。</p>';
@@ -550,14 +552,15 @@ function renderComparison() {
   const model = row.models[alias] || {};
   const selection = row.selection;
   const automatic = selection.model_alias;
-  const adopted = row.decision?.status === "approved" ? row.decision.model_alias : automatic;
-  const heading = row.decision?.status === "rejected" ? "已排除 · 候选转录" :
-    !alias && selection.status === "needs_choice" ? "请选择模型转录" :
-    alias === adopted || !alias ? "采用的 OCR 标签" : "候选转录预览";
+  let heading = "候选转录";
+  if (alias && row.decision?.status === "approved" && alias === row.decision.model_alias) {
+    heading = "人工已采用";
+  } else if (alias && !row.decision && alias === automatic) {
+    heading = "自动选定的转录";
+  }
   q("#selection-heading").textContent = heading;
   q("#selection-model").textContent = alias ? nameOf(alias) : "";
   const details = [];
-  if (alias && alias === adopted && row.decision?.status !== "rejected") details.push(row.decision ? "人工确认" : "自动选定");
   if (alias && alias !== automatic) details.push(automatic ? "自动择优 · " + nameOf(automatic) : "无自动择优结果");
   if (selection.prob_yes != null) details.push("自动择优分 " + number(selection.prob_yes));
   if (selection.margin != null) details.push("领先 " + number(selection.margin));
@@ -645,6 +648,13 @@ function renderCase() {
   const listed = state.rows.find(item => item.case_id === row.case_id);
   const decision = row.decision;
   const stateLabel = decision?.status || "pending";
+  const reviewStatus = decision?.status === "approved" ? "人工已采用" : decision ? statuses[stateLabel] : "未人工复核";
+  const suggested = decision ? null : row.selection.model_alias;
+  const candidates = Object.keys(row.models).filter(key => row.models[key].label);
+  if (suggested && candidates.includes(suggested)) {
+    candidates.splice(candidates.indexOf(suggested), 1);
+    candidates.unshift(suggested);
+  }
   const crop = casePath() + "/image/crop";
   const page = casePath() + "/image/page";
   const badges = row.reasons.map(reasonBadge).join("")
@@ -653,7 +663,7 @@ function renderCase() {
     <div class="case-header">
       <div class="case-heading">
         <div class="case-eyebrow"><span class="task-chip">${esc(tasks[row.task])}</span>
-          <span class="case-status ${esc(stateLabel)}">${esc(decision ? statuses[stateLabel] : row.selection.model_alias ? "已自动选定" : row.selection.status === "needs_choice" ? "待人工选模" : "无有效转录")}</span>
+          <span class="case-status ${esc(stateLabel)}">${esc(decision ? reviewStatus : row.selection.model_alias ? "已自动选定" : row.selection.status === "needs_choice" ? "待人工选模" : "无有效转录")}</span>
           ${listed?.target_error ? '<span class="case-status incorrect">Paddle 有误</span>' : ""}
           ${listed?.repairable ? '<span class="case-status correct">有正确替代</span>' : ""}</div>
         <h2 title="${esc(row.doc_id)}">${esc(row.doc_id.split("/").pop())}</h2>
@@ -665,52 +675,55 @@ function renderCase() {
         <button id="next" type="button">下一条</button>
       </div>
     </div>
-    <div class="comparison-layout">
-      <figure class="source original-pane"><figcaption>整页原图 <span>第 ${esc(row.page_id)} 页</span></figcaption>
-          ${row.page_geometry ? `<button type="button" class="page-preview" aria-label="放大整页原图" data-image="${esc(page)}" data-page="true">
-          ${pageFrame(page, row.page_geometry)}</button>` : '<p class="empty">原页文件不可用。</p>'}
-      </figure>
-      <figure class="source crop-pane"><figcaption>区域裁图 <span>区域 ${esc(row.region_id)}</span></figcaption>
-          ${row.has_crop ? `<button type="button" class="crop" aria-label="放大区域裁图" data-image="${esc(crop)}">
-          <img src="${esc(crop)}" alt="区域 ${esc(row.region_id)} 的裁图"></button>` : '<p class="empty">裁图文件不可用。</p>'}
-      </figure>
-      <section class="panel selection-pane">
-        <header class="panel-heading"><h3 id="selection-heading"></h3><span id="selection-model"></span>
-          ${row.task === "table" ? '<button type="button" id="selection-table" data-open-sheet></button>' : ""}</header>
-        <div class="output-scroll" id="selection-output" tabindex="0"></div>
-        <p class="selection-detail" id="selection-detail"></p>
-        ${referenceVerdict(row.selection_gt)}
-      </section>
-      <details class="panel inspection-details" id="comparison-details" ${row.selection.status === "needs_choice" && !decision ? "open" : ""}><summary>各模型转录与判定依据</summary>
-        <div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset>
-</div>
-        <section class="decision-summary">
-          <div><h3>${listed?.queued ? (row.audit_sample ? "随机抽检入队" : "难例入队") : "未入审核队列"} · 判定依据</h3><div class="chips">${badges}</div>${evidenceDetails(row)}</div>
-          <div class="priority"><span>排序分</span><strong>${number(row.priority)}</strong></div>
+    <div class="inspection-body">
+      <div class="comparison-layout">
+        <figure class="source original-pane"><figcaption>整页原图 <span>点击放大</span></figcaption>
+            ${row.page_geometry ? `<button type="button" class="page-preview" aria-label="放大整页原图" data-image="${esc(page)}" data-page="true">
+            ${pageFrame(page, row.page_geometry)}</button>` : '<p class="empty">原页文件不可用。</p>'}
+        </figure>
+        <figure class="source crop-pane"><figcaption>区域裁图 <span>点击放大</span></figcaption>
+            ${row.has_crop ? `<button type="button" class="crop" aria-label="放大区域裁图" data-image="${esc(crop)}">
+            <img src="${esc(crop)}" alt="区域 ${esc(row.region_id)} 的裁图"></button>` : '<p class="empty">裁图文件不可用。</p>'}
+        </figure>
+        <section class="panel selection-pane">
+          <header class="panel-heading"><h3 id="selection-heading"></h3><span id="selection-model"></span>
+            ${row.task === "table" ? '<button type="button" id="selection-table" data-open-sheet></button>' : ""}</header>
+          <div class="output-scroll" id="selection-output" tabindex="0"></div>
+          <p class="selection-detail" id="selection-detail"></p>
+          ${referenceVerdict(row.selection_gt)}
         </section>
-      <section class="comparison">
-        <header class="panel-heading"><h3>识别对照</h3><div class="panel-actions"><span>Jev 一致性分</span>
-          ${row.task === "table" ? '<button type="button" id="open-table">放大表格</button>' : ""}</div></header>
-        <div class="diff-controls">
-          <label>差异基准<select id="compare-with">${Object.keys(row.models).filter(k=>row.models[k].label).map(k=>`<option value="${esc(k)}" ${k===row.target_alias?"selected":""}>${esc(nameOf(k))}</option>`).join("")}${row.reference?'<option value="reference">参考标注</option>':""}</select></label>
-          ${row.task === "text" ? '<label><input id="only-changes" type="checkbox">仅看分歧</label>' : ""}
-          ${row.task === "table" ? '<label><input id="diff-mode" type="checkbox">只看差异格</label>' : ""}
-          <label><input id="difference" type="checkbox" checked>高亮差异</label>
-        </div>
-        ${row.task === "table" ? '<nav id="preview-range" aria-label="表格预览范围"></nav>' : ""}
-        <div id="model-pair" class="output-pair ${row.task === "table" ? "table-preview" : ""}"></div>
-        ${row.reference ? `<details class="inspection-details"><summary>查看参考标注</summary><div class="output-scroll">${output(row.reference,row.reference_view,false)}</div></details>` : ""}
-        <details class="inspection-details"><summary id="raw-title"></summary>
-          <pre id="raw-output"></pre><pre id="request-info"></pre></details>
-      </section>
+      </div>
+      <details class="panel inspection-details" id="comparison-details" ${row.selection.status === "needs_choice" && !decision ? "open" : ""}>
+        <summary>模型转录对照</summary>
+        <section class="comparison">
+          <div class="diff-controls">
+            <label>差异基准<select id="compare-with">${Object.keys(row.models).filter(k=>row.models[k].label).map(k=>`<option value="${esc(k)}" ${k===row.target_alias?"selected":""}>${esc(nameOf(k))}</option>`).join("")}${row.reference?'<option value="reference">参考标注</option>':""}</select></label>
+            ${row.task === "text" ? '<label><input id="only-changes" type="checkbox">仅看分歧</label>' : ""}
+            ${row.task === "table" ? '<label><input id="diff-mode" type="checkbox">只看差异格</label>' : ""}
+            <label><input id="difference" type="checkbox" checked>高亮差异</label>
+            ${row.task === "table" ? '<button type="button" id="open-table">放大表格</button>' : ""}
+          </div>
+          ${row.task === "table" ? '<nav id="preview-range" aria-label="表格预览范围"></nav>' : ""}
+          <div id="model-pair" class="output-pair ${row.task === "table" ? "table-preview" : ""}"></div>
+          <div class="preview-tools"><fieldset><legend>显示模型</legend><div id="visible-models"></div></fieldset></div>
+          <details class="inspection-details"><summary>判定依据</summary>
+            <section class="decision-summary">
+              <div><h3>${listed?.queued ? (row.audit_sample ? "随机抽检入队" : "难例入队") : "未入审核队列"}</h3><div class="chips">${badges}</div>${evidenceDetails(row)}</div>
+              <div class="priority"><span>排序分</span><strong>${number(row.priority)}</strong></div>
+            </section>
+          </details>
+          ${row.reference ? `<details class="inspection-details"><summary>查看参考标注</summary><div class="output-scroll">${output(row.reference,row.reference_view,false)}</div></details>` : ""}
+          <details class="inspection-details"><summary id="raw-title"></summary>
+            <pre id="raw-output"></pre><pre id="request-info"></pre></details>
+        </section>
       </details>
     </div>
     <section class="review-dock" aria-label="人工复核">
-      <div class="review-selection"><strong>采用哪份转录？</strong><small id="review-choice"></small></div>
+      <div class="review-selection"><strong class="case-status ${esc(stateLabel)}">${esc(reviewStatus)}</strong><small id="review-choice"></small></div>
       <div class="review-actions">
-        ${Object.keys(row.models).filter(key => row.models[key].label).map(key =>
-          `<button type="button" data-review="approved" data-alias="${esc(key)}"
-            title="${esc(row.models[key].label.slice(0, 180))}">${esc(nameOf(key))}</button>`).join("")}
+        ${candidates.map(key =>
+          `<button type="button" ${key === suggested ? 'class="primary"' : ""} data-review="approved" data-alias="${esc(key)}"
+            title="${esc(row.models[key].label.slice(0, 180))}">采用 ${esc(nameOf(key))}</button>`).join("")}
         <button id="reject" type="button" data-review="rejected">全部不采用</button>
       </div>
     </section>`;
@@ -904,16 +917,22 @@ function renderOverview() {
   if (q("#overview").hidden || !state.data) return;
   const {summary, report, rows} = state.data;
   const reviewed = rows.filter(row => ["approved", "rejected"].includes(row.review_status)).length;
+  const needsChoice = rows.filter(row => row.selection_status === "needs_choice" && row.review_status === "pending").length;
+  const selected = rows.filter(row => row.selection_status === "selected").length;
   const sources = Object.entries(state.data.sources || {});
   const scores = summary.judge_status;
   const totalScores = Object.values(scores).reduce((sum, count) => sum + count, 0);
-  const cards = [["区域总数", rows.length], ["规则命中", summary.hard_cases], ["已自动选定", rows.filter(row => row.selection_status === "selected").length],
-    ["待人工选模", rows.filter(row => row.selection_status === "needs_choice" && row.review_status === "pending").length], ["已完成复核", reviewed], ["Jev 有效评分率", totalScores ? percent((scores.scored || 0) / totalScores) : "—"]];
-  if (summary.training) cards.push(["批次训练集", summary.training.train], ["批次验证集", summary.training.val]);
   const counts = {};
   rows.forEach(row => row.reasons.forEach(key => { counts[key] = (counts[key] || 0) + 1; }));
-  q("#overview").innerHTML = `<h2>批次总览</h2><div class="stat-grid">${cards.map(([name, value]) =>
-    `<div class="stat-card"><span>${name}</span><strong>${value}</strong></div>`).join("")}</div>
+  q("#overview").innerHTML = `<h2>批次总览</h2>
+    <div class="stat-grid">
+      <div class="stat-card${needsChoice ? " next-stat" : ""}"><span>待人工选模</span><strong>${needsChoice}</strong>
+        ${needsChoice ? '<button type="button" class="primary" id="overview-review">去复核</button>' : ""}</div>
+      <div class="stat-card"><span>已完成复核</span><strong>${reviewed}<small> / ${rows.length}</small></strong></div>
+      <div class="stat-card"><span>已自动选定</span><strong>${selected}</strong></div>
+      <div class="stat-card"><span>难例规则命中</span><strong>${summary.hard_cases}</strong></div>
+    </div>
+    ${summary.training ? `<p class="training-counts">SFT 数据 · 训练集 <b>${summary.training.train}</b> · 验证集 <b>${summary.training.val}</b></p>` : ""}
     ${state.data.selection_gt?.with_reference ? `<section class="panel gt-comparison"><strong>自动择优与 GT 对照</strong>
       <small>匹配 GT ${state.data.selection_gt.with_reference} 个区域 · 有至少两份有效候选且已择优 ${state.data.selection_gt.comparable} 个 · 命中最近候选 ${state.data.selection_gt.closest} 个</small></section>` : ""}
     ${sources.length ? `<details class="panel inspection-details"><summary>输入文件 · ${sources.length} 份 / ${sources.reduce((n,[,pages])=>n+pages,0)} 页</summary>
@@ -922,12 +941,21 @@ function renderOverview() {
     <div class="overview-grid">
     <section class="panel overview-panel"><header class="panel-heading"><h3>入队原因分布</h3></header>${Object.entries(counts)
       .sort((a, b) => b[1] - a[1]).map(([key, count]) =>
-        `<div class="bar-row"><span>${esc(reasons[key] || key)}</span><meter min="0" max="${rows.length}" value="${count}"></meter><b>${count}</b></div>`).join("") || '<p>没有触发记录。</p>'}</section>
-    <section class="panel overview-panel"><header class="panel-heading"><h3>模型状态</h3></header>${Object.entries(summary.model_status)
+        `<div class="bar-row"><span>${esc(reasons[key] || key)}</span><meter min="0" max="${rows.length}" value="${count}"></meter><b>${count}</b></div>`).join("") || '<p class="overview-empty">没有触发记录。</p>'}</section>
+    <section class="panel overview-panel"><header class="panel-heading"><h3>模型运行质量</h3>
+      <span>Jev 有效评分率 <b>${totalScores ? percent((scores.scored || 0) / totalScores) : "—"}</b></span></header>${Object.entries(summary.model_status)
       .filter(([, counts]) => Object.keys(counts).length).map(([alias, counts]) =>
         `<div class="service-row"><strong>${esc(nameOf(alias))}</strong><span>${Object.entries(counts)
           .map(([key, count]) => esc(key === "ok" ? "有效" : judgeStatuses[key] || key) + " " + count).join(" · ")}</span></div>`)
       .join("")}</section></div>`;
+  q("#overview-review")?.addEventListener("click", () => {
+    if (state.saving) return;
+    clearFilters();
+    q("#scope").value = "needs_choice";
+    view("review");
+    filterQueue();
+    q("#scope").focus({preventScroll: true});
+  });
   if (report) {
     q("#strategy-task").addEventListener("change", renderStrategy);
     renderStrategy();
@@ -960,10 +988,16 @@ function view(page) {
   if (page === "settings") initSettings();
   q("#overview").hidden = page !== "overview";
   if (page === "overview") renderOverview();
+  q("#view-library").setAttribute("aria-pressed", page === "library");
   q("#view-review").setAttribute("aria-pressed", page === "review");
   q("#view-overview").setAttribute("aria-pressed", page === "overview");
 }
 
+q("#view-library").addEventListener("click", () => {
+  if (!q("#library").hidden) return;
+  view("library");
+  refreshImports();
+});
 q("#view-review").addEventListener("click", () => view("review"));
 q("#view-overview").addEventListener("click", () => view("overview"));
 q("#mobile-queue").onclick = event => {
@@ -1093,17 +1127,18 @@ function renderImports() {
   q("#import-message").textContent = !imports.length ? "下方结果目录中暂无可导入的批次。请确认完整推理已结束，再点击刷新。" :
     !items.length ? "没有匹配的批次，可更换文件名或清空搜索。" : "";
   q("#import-list").innerHTML = items.slice(0, visibleImports).map(item => {
-    const title = item.first_doc || batchLabel(item.name);
+    const batch = batchLabel(item.name);
+    const title = item.first_doc || batch;
     const extension = item.first_doc?.match(/\.(pdf|jpe?g|png)$/i)?.[1].toUpperCase();
     const cover = item.has_cover ? `<img src="/api/imports/${encodeURIComponent(item.name)}/cover" alt="" loading="lazy" decoding="async">` : "";
-    return `<button class="batch-card" data-import="${esc(item.name)}" title="${esc(title)}"
-      aria-label="${esc("导入并复核 · " + title + " · " + batchLabel(item.name))}" ${importing ? "disabled" : ""}>
+    return `<button class="batch-card" data-import="${esc(item.name)}" title="${esc(title + " · " + item.name)}"
+      aria-label="${esc("导入并复核 · " + title + (item.first_doc ? " · " + batch : ""))}" ${importing ? "disabled" : ""}>
       <span class="batch-cover" aria-hidden="true">
         <span class="file-standin"></span>${cover}
         ${extension ? `<span class="file-extension">${esc(extension)}</span>` : ""}
       </span>
-      <span class="batch-info"><strong>${esc(title)}</strong>
-      <small>${item.first_doc ? esc(batchLabel(item.name)) : ""}</small></span>
+      <span class="batch-info"><strong>${esc(batch)}</strong>
+      ${item.first_doc ? `<small>${esc(item.first_doc)}</small>` : ""}</span>
       <span class="batch-action"><span>${Number.isInteger(item.regions) ? item.regions + " 个区域" : ""}</span>
       <b>${importing === item.name ? "正在导入…" : "导入并复核 →"}</b></span></button>`;
   }).join("");

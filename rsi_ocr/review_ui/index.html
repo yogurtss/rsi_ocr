@@ -4,14 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GlyphStack · 文档复核</title>
-  <link rel="stylesheet" href="/assets/workbench.css">
-  <script src="/assets/workbench.js?v=sample-selection-scopes" defer></script>
+  <link rel="stylesheet" href="/assets/workbench.css?v=desktop-workbench">
+  <script src="/assets/workbench.js?v=desktop-workbench" defer></script>
   <script src="/assets/settings.js" defer></script>
 </head>
 <body>
   <header class="topbar">
     <div class="identity"><span class="brand" aria-hidden="true"></span><h1>GlyphStack <span>Studio</span></h1></div>
     <nav class="navigation" aria-label="工作台页面">
+      <button id="view-library" aria-pressed="true">批次库</button>
       <button id="view-review" aria-pressed="false" disabled>复核</button>
       <button id="view-overview" aria-pressed="false" disabled>批次总览</button>
       <button id="view-settings" aria-pressed="false">设置</button>
@@ -25,23 +26,23 @@
           <button type="button" id="training-download" data-export="train" hidden>SFT 训练集 JSONL</button>
           <button type="button" id="validation-download" data-export="val" hidden>SFT 验证集 JSONL</button></div>
       </details>
-      <button class="primary" id="import-open" aria-haspopup="dialog" aria-controls="import-dialog"><span aria-hidden="true">＋</span> 导入结果</button>
+      <button id="import-open" aria-haspopup="dialog" aria-controls="import-dialog">按路径导入</button>
     </div>
   </header>
   <div id="notice" class="notice" role="status" hidden></div>
   <main class="library" id="library" aria-labelledby="library-title">
-    <header class="library-heading"><h2 id="library-title">导入识别结果</h2>
-      <p>选择服务器上已完成的批次，打开原图与识别结果。</p></header>
-    <section class="library-list" aria-labelledby="imports-heading">
-      <div class="library-tools"><h3 id="imports-heading">全部批次 <span id="import-count"></span></h3>
+    <header class="library-tools">
+      <div class="library-title"><h2 id="library-title">识别批次</h2><span id="import-count"></span></div>
+      <div class="library-search">
         <input type="search" id="import-search" aria-label="搜索批次或文件名" placeholder="搜索批次或文件名" hidden>
-        <button id="import-refresh">刷新</button></div>
-      <p id="import-message" role="status">正在获取可导入的批次列表…</p>
-      <div class="import-progress" id="card-progress" hidden><span role="status"></span><progress aria-label="批次读取进度"></progress></div>
-      <div id="import-list"></div>
-      <button type="button" id="import-more" hidden></button>
-      <footer id="import-root"></footer>
-    </section>
+        <button id="import-refresh">刷新</button>
+      </div>
+    </header>
+    <p id="import-message" role="status">正在获取可导入的批次列表…</p>
+    <div class="import-progress" id="card-progress" hidden><span role="status"></span><progress aria-label="批次读取进度"></progress></div>
+    <div id="import-list"></div>
+    <button type="button" id="import-more" hidden></button>
+    <footer id="import-root"></footer>
   </main>
   <dialog id="import-dialog" aria-labelledby="import-dialog-title">
     <div class="dialog-bar"><strong id="import-dialog-title">按路径导入结果</strong>
